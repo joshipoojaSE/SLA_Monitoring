@@ -6,6 +6,7 @@ returns a report on what was found. Nothing is written to the database yet.
 
 import csv
 import io
+import os
 from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
@@ -14,6 +15,7 @@ from enum import Enum
 from typing import Literal
 
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import psycopg
 from sqlalchemy import func, select, text
@@ -87,6 +89,16 @@ MAX_REPORTED_REJECTIONS = 20
 # incident, which is how dataset_incident_log.json describes them. Either way
 # the downtime is the same: only failed checks are ever counted.
 MAX_HEALTHY_GAP_SLOTS = 0
+
+# The SLA from the brief: monthly availability below 99.9% earns a credit.
+SLA_TARGET_PCT = 99.9
+
+MAX_LOG_PAGE_SIZE = 200
+
+# Comma-separated; the Vite dev server by default.
+CORS_ORIGINS = [
+    origin.strip() for origin in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",") if origin.strip()
+]
 
 
 class ErrorCode(str, Enum):
@@ -196,6 +208,71 @@ class OutageReport(BaseModel):
     services_affected: list[str]
     total_downtime_minutes: int
     incidents: list[OutageIncident]
+
+
+class FileSummary(BaseModel):
+    """One upload, as the dashboard's file picker lists it."""
+
+    file_id: int
+    file_name: str
+    uploaded_at: datetime
+    rows_received: int
+    stored_checks: int
+    scanned: bool
+
+
+class ServiceStats(BaseModel):
+    service_id: str
+    service_name: str
+    up_checks: int
+    down_checks: int
+    invalid_checks: int
+    missing_checks: int
+    # None when the service has no valid check to judge it by.
+    availability_pct: float | None
+    meets_sla: bool | None
+    downtime_minutes: int
+    allowed_downtime_minutes: float
+    incidents: int
+    longest_incident_minutes: int
+    avg_latency_ms: float | None
+    p95_latency_ms: float | None
+
+
+class DashboardStats(BaseModel):
+    """Everything the collapsible stats section shows for one file."""
+
+    file_id: int
+    file_name: str
+    scanned: bool
+    sla_target_pct: float
+    coverage_start: datetime
+    coverage_end: datetime
+    days: int
+    expected_checks: int
+    stored_checks: int
+    availability_pct: float | None
+    services_breaching: int
+    total_downtime_minutes: int
+    services: list[ServiceStats]
+    incidents: list[OutageIncident]
+
+
+class LogRow(BaseModel):
+    checked_at: datetime
+    service_id: str
+    status_code: int
+    outcome: str
+    latency_ms: float | None
+    agent_id: str
+    region_id: str
+
+
+class LogPage(BaseModel):
+    total: int
+    page: int
+    page_size: int
+    items: list[LogRow]
 
 
 # --------------------------------------------------------------------------
@@ -898,9 +975,207 @@ def scan_outages(file_id: int) -> OutageReport:
 
     return _outage_report(file_id, file_name, False, start_date, days, incidents)
 
+
+# --------------------------------------------------------------------------
+# Dashboard reads
+#
+# Availability is up / (up + down). Invalid codes and missing slots are left
+# out rather than counted as failures (decision D3: no data is not a
+# failure), and reported beside it so the reader can see how much the number
+# rests on.
+# --------------------------------------------------------------------------
+
+
+def _stored_file(session: Session, file_id: int) -> UploadedFile:
+    """An upload the dashboard can show: one that saved completely."""
+    uploaded = session.get(UploadedFile, file_id)
+    if uploaded is None or uploaded.status != "done":
+        raise HTTPException(status_code=404, detail=f"No completed upload with id {file_id}.")
+    return uploaded
+
+
+def _pct(part: int, whole: int) -> float | None:
+    return round(part * 100 / whole, 4) if whole else None
+
+
+def list_files() -> list[FileSummary]:
+    checks = (
+        select(ServiceStatusLog.file_id, func.count().label("stored_checks"))
+        .group_by(ServiceStatusLog.file_id)
+        .subquery()
+    )
+    query = (
+        select(
+            UploadedFile,
+            func.coalesce(checks.c.stored_checks, 0),
+            TestOutage.file_name.is_not(None),
+        )
+        .outerjoin(checks, checks.c.file_id == UploadedFile.file_id)
+        .outerjoin(TestOutage, TestOutage.file_name == UploadedFile.file_name)
+        .where(UploadedFile.status == "done")
+        .order_by(UploadedFile.uploaded_at.desc())
+    )
+    with Session(engine) as session:
+        return [
+            FileSummary(
+                file_id=uploaded.file_id,
+                file_name=uploaded.file_name,
+                uploaded_at=uploaded.uploaded_at,
+                rows_received=uploaded.rows_received,
+                stored_checks=stored_checks,
+                scanned=scanned,
+            )
+            for uploaded, stored_checks, scanned in session.execute(query)
+        ]
+
+
+def dashboard_stats(file_id: int) -> DashboardStats:
+    with Session(engine) as session:
+        uploaded = _stored_file(session, file_id)
+
+        first, last = session.execute(LOAD_COVERAGE.where(ServiceStatusLog.file_id == file_id)).one()
+        if first is None:
+            raise HTTPException(status_code=404, detail=f"File {file_id} has no stored checks.")
+        start_date = first.date()
+        days = (last.date() - start_date).days + 1
+
+        per_service = session.execute(
+            select(
+                ServiceStatusLog.service_id,
+                Service.service_name,
+                func.count().filter(ServiceStatusLog.outcome == "up"),
+                func.count().filter(ServiceStatusLog.outcome == "down"),
+                func.count().filter(ServiceStatusLog.outcome == "invalid"),
+                func.avg(ServiceStatusLog.latency_ms),
+                func.percentile_cont(0.95).within_group(ServiceStatusLog.latency_ms),
+            )
+            .join(Service, Service.service_id == ServiceStatusLog.service_id)
+            .where(ServiceStatusLog.file_id == file_id)
+            .group_by(ServiceStatusLog.service_id, Service.service_name)
+            .order_by(ServiceStatusLog.service_id)
+        ).all()
+
+        # A scanned file shows exactly what was stored; one not scanned yet is
+        # detected on the fly, without writing anything.
+        outage = session.get(TestOutage, uploaded.file_name)
+        if outage is not None:
+            incidents = _stored_incidents(session, file_id, outage)
+        else:
+            down_checks = [
+                (row.service_id, row.checked_at)
+                for row in session.execute(LOAD_DOWN_CHECKS.where(ServiceStatusLog.file_id == file_id))
+            ]
+            incidents = detect_incidents(down_checks, start_date)
+
+    services: list[ServiceStats] = []
+    for service_id, service_name, up, down, invalid, avg_latency, p95_latency in per_service:
+        own = [incident for incident in incidents if incident.service_id == service_id]
+        availability = _pct(up, up + down)
+        services.append(
+            ServiceStats(
+                service_id=service_id,
+                service_name=service_name,
+                up_checks=up,
+                down_checks=down,
+                invalid_checks=invalid,
+                missing_checks=max(0, CHECKS_PER_DAY * days - (up + down + invalid)),
+                availability_pct=availability,
+                meets_sla=None if availability is None else availability >= SLA_TARGET_PCT,
+                downtime_minutes=down * SLOT_MINUTES,
+                # The downtime the SLA tolerates over the minutes actually observed.
+                allowed_downtime_minutes=round((up + down) * SLOT_MINUTES * (100 - SLA_TARGET_PCT) / 100, 2),
+                incidents=len(own),
+                longest_incident_minutes=max((incident.downtime_minutes for incident in own), default=0),
+                avg_latency_ms=None if avg_latency is None else round(float(avg_latency), 1),
+                p95_latency_ms=None if p95_latency is None else round(float(p95_latency), 1),
+            )
+        )
+
+    total_up = sum(service.up_checks for service in services)
+    total_down = sum(service.down_checks for service in services)
+    return DashboardStats(
+        file_id=file_id,
+        file_name=uploaded.file_name,
+        scanned=outage is not None,
+        sla_target_pct=SLA_TARGET_PCT,
+        coverage_start=first,
+        coverage_end=last,
+        days=days,
+        expected_checks=len(services) * CHECKS_PER_DAY * days,
+        stored_checks=sum(s.up_checks + s.down_checks + s.invalid_checks for s in services),
+        availability_pct=_pct(total_up, total_up + total_down),
+        services_breaching=sum(service.meets_sla is False for service in services),
+        total_downtime_minutes=total_down * SLOT_MINUTES,
+        services=services,
+        incidents=incidents,
+    )
+
+
+def read_logs(
+    file_id: int,
+    date_from: date | None,
+    date_to: date | None,
+    service_id: str | None,
+    outcome: str | None,
+    page: int,
+    page_size: int,
+) -> LogPage:
+    """One page of stored checks. Dates are whole UTC days, both inclusive."""
+    if date_from and date_to and date_to < date_from:
+        raise HTTPException(status_code=422, detail="date_to is before date_from.")
+
+    conditions = [ServiceStatusLog.file_id == file_id]
+    if date_from:
+        conditions.append(ServiceStatusLog.checked_at >= datetime.combine(date_from, datetime.min.time(), UTC))
+    if date_to:
+        next_day = datetime.combine(date_to + timedelta(days=1), datetime.min.time(), UTC)
+        conditions.append(ServiceStatusLog.checked_at < next_day)
+    if service_id:
+        conditions.append(ServiceStatusLog.service_id == service_id)
+    if outcome:
+        conditions.append(ServiceStatusLog.outcome == outcome)
+
+    with Session(engine) as session:
+        _stored_file(session, file_id)
+        total = session.execute(select(func.count()).select_from(ServiceStatusLog).where(*conditions)).scalar_one()
+        rows = session.execute(
+            select(ServiceStatusLog, Agent.region_id)
+            .join(Agent, Agent.agent_id == ServiceStatusLog.agent_id)
+            .where(*conditions)
+            .order_by(ServiceStatusLog.checked_at, ServiceStatusLog.service_id)
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        ).all()
+
+    return LogPage(
+        total=total,
+        page=page,
+        page_size=page_size,
+        items=[
+            LogRow(
+                checked_at=log.checked_at,
+                service_id=log.service_id,
+                status_code=log.status_code,
+                outcome=log.outcome,
+                latency_ms=None if log.latency_ms is None else float(log.latency_ms),
+                agent_id=log.agent_id,
+                region_id=region_id,
+            )
+            for log, region_id in rows
+        ],
+    )
+
 # --------------------------------------------------------------------------
 # Routes
 # --------------------------------------------------------------------------
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
 
 
 @app.get("/health")
@@ -951,3 +1226,38 @@ def create_outages(file_id: int = Query(..., ge=1, description="An uploaded file
         return scan_outages(file_id)
     except (SQLAlchemyError, psycopg.Error) as exc:
         raise HTTPException(status_code=503, detail="The outages could not be read or saved.") from exc
+
+
+@app.get("/files", response_model=list[FileSummary])
+def get_files() -> list[FileSummary]:
+    """Uploads that saved completely, newest first."""
+    try:
+        return list_files()
+    except (SQLAlchemyError, psycopg.Error) as exc:
+        raise HTTPException(status_code=503, detail="The uploads could not be read.") from exc
+
+
+@app.get("/files/{file_id}/stats", response_model=DashboardStats)
+def get_stats(file_id: int) -> DashboardStats:
+    """SLA, downtime, incident and latency figures per service for one file."""
+    try:
+        return dashboard_stats(file_id)
+    except (SQLAlchemyError, psycopg.Error) as exc:
+        raise HTTPException(status_code=503, detail="The stats could not be read.") from exc
+
+
+@app.get("/files/{file_id}/logs", response_model=LogPage)
+def get_logs(
+    file_id: int,
+    date_from: date | None = Query(None, description="First UTC day, inclusive"),
+    date_to: date | None = Query(None, description="Last UTC day, inclusive; equal to date_from for a single day"),
+    service_id: str | None = None,
+    outcome: Literal["up", "down", "invalid"] | None = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=MAX_LOG_PAGE_SIZE),
+) -> LogPage:
+    """The stored checks behind the stats, filtered and paged."""
+    try:
+        return read_logs(file_id, date_from, date_to, service_id, outcome, page, page_size)
+    except (SQLAlchemyError, psycopg.Error) as exc:
+        raise HTTPException(status_code=503, detail="The logs could not be read.") from exc
