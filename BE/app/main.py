@@ -1,10 +1,665 @@
-from fastapi import FastAPI, HTTPException
-from sqlalchemy import text
+"""SLA Monitoring API.
+
+Upload endpoint: takes a CSV of health checks, validates it, cleans it and
+returns a report on what was found. Nothing is written to the database yet.
+"""
+
+import csv
+import io
+from collections import Counter
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
+from enum import Enum
+from typing import Literal
+
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from pydantic import BaseModel
+import psycopg
+from sqlalchemy import select, text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session
 
 from app.database import engine  # loads .env
+from app.models import Agent, Region, Service, UploadedFile
 
 app = FastAPI(title="SLA Monitoring API")
+
+# --------------------------------------------------------------------------
+# Rules
+# --------------------------------------------------------------------------
+
+ALLOWED_EXTENSIONS = (".csv",)
+
+# The 30-day sample file is 1.1 MB. The cap is generous for this data and
+# still under the few-MB request body limit serverless platforms impose.
+MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+
+REQUIRED_COLUMNS = (
+    "service_id",
+    "service_name",
+    "timestamp",
+    "status_code",
+    "latency",
+    "latency_unit",
+    "agent",
+    "region",
+)
+
+# One check per service every 15 minutes.
+CHECK_INTERVAL_SECONDS = 900
+CHECKS_PER_DAY = 86_400 // CHECK_INTERVAL_SECONDS
+
+LATENCY_MULTIPLIERS = {"ms": Decimal(1), "s": Decimal(1000)}
+
+# A code has to fit the smallint column and be a plausible three-digit status.
+# The seeded 999 is kept (as 'invalid'); 999999 is not a status code at all.
+MIN_STATUS_CODE = 100
+MAX_STATUS_CODE = 999
+
+# The largest value the Numeric(12, 3) column holds: about 11.5 days, far past
+# anything a health check could report.
+MAX_LATENCY_MS = Decimal("999999999.999")
+
+# Decision D1: a failure seen by any agent is real evidence, and a valid
+# reading beats an invalid code. Lower sorts first, so it wins the slot.
+OUTCOME_PRIORITY = {"down": 0, "up": 1, "invalid": 2}
+
+MAX_REPORTED_REJECTIONS = 20
+
+
+class ErrorCode(str, Enum):
+    """Reasons a file is rejected outright, with no report to return."""
+
+    NO_FILE = "NO_FILE"
+    UNSUPPORTED_FILE_TYPE = "UNSUPPORTED_FILE_TYPE"
+    FILE_TOO_LARGE = "FILE_TOO_LARGE"
+    EMPTY_FILE = "EMPTY_FILE"
+    UNREADABLE_ENCODING = "UNREADABLE_ENCODING"
+    MISSING_HEADER = "MISSING_HEADER"
+    MISSING_COLUMNS = "MISSING_COLUMNS"
+    DUPLICATE_COLUMNS = "DUPLICATE_COLUMNS"
+    NO_DATA_ROWS = "NO_DATA_ROWS"
+    NO_VALID_ROWS = "NO_VALID_ROWS"
+
+
+class UploadRejected(Exception):
+    """An uploaded file that cannot be processed at all."""
+
+    def __init__(self, code: ErrorCode, message: str, details: dict | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.details = details or {}
+
+
+class RowError(ValueError):
+    """A single row that cannot be cleaned. Skipped and counted, not fatal."""
+
+
+# --------------------------------------------------------------------------
+# Response models
+# --------------------------------------------------------------------------
+
+
+class Coverage(BaseModel):
+    start: datetime
+    end: datetime
+    days: int
+    services: list[str]
+    expected_checks: int
+    missing_checks: int
+
+
+class DuplicateReport(BaseModel):
+    total: int
+    exact_rows: int
+    same_slot_rows: int
+    conflicting_slots: int
+
+
+class IssueReport(BaseModel):
+    epoch_timestamps: int = 0
+    offset_timestamps: int = 0
+    naive_timestamps: int = 0
+    latency_converted_from_seconds: int = 0
+    blank_latency: int = 0
+    negative_latency: int = 0
+    invalid_status_codes: int = 0
+
+
+class RejectedRowReport(BaseModel):
+    line: int
+    reason: str
+
+
+class UploadReport(BaseModel):
+    """What the upload screen shows once a file has been accepted."""
+
+    file_id: int
+    file_name: str
+    status: Literal["clean", "accepted_with_warnings"]
+    rows_received: int
+    clean_checks: int
+    rows_removed: int
+    coverage: Coverage
+    duplicates: DuplicateReport
+    issues: IssueReport
+    ragged_rows: int
+    rejected_rows: list[RejectedRowReport]
+    warnings: list[str]
+
+
+# --------------------------------------------------------------------------
+# Working types
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RawRow:
+    """One data line, keyed by normalized column name."""
+
+    line: int
+    values: dict[str, str]
+    raw: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class CleanCheck:
+    line: int
+    service_id: str
+    service_name: str
+    checked_at: datetime
+    status_code: int
+    outcome: str
+    latency_ms: Decimal | None
+    agent_id: str
+    region_id: str
+
+
+@dataclass
+class CleanResult:
+    checks: list[CleanCheck]
+    rows_received: int
+    issues: Counter
+    duplicates: DuplicateReport
+    rejected: list[RejectedRowReport]
+
+
+# --------------------------------------------------------------------------
+# File and structure checks, before any row is looked at
+# --------------------------------------------------------------------------
+
+
+def validate_file(file_name: str, content: bytes) -> str:
+    """Check the file itself and return its decoded text."""
+    if not file_name:
+        raise UploadRejected(ErrorCode.NO_FILE, "No file was uploaded.")
+
+    if not file_name.lower().endswith(ALLOWED_EXTENSIONS):
+        raise UploadRejected(
+            ErrorCode.UNSUPPORTED_FILE_TYPE,
+            f"Only {', '.join(ALLOWED_EXTENSIONS)} files are accepted.",
+            {"file_name": file_name},
+        )
+
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise UploadRejected(
+            ErrorCode.FILE_TOO_LARGE,
+            f"The file is larger than the {MAX_UPLOAD_BYTES // (1024 * 1024)} MB limit.",
+            {"size_bytes": len(content), "limit_bytes": MAX_UPLOAD_BYTES},
+        )
+
+    # Whitespace only counts as empty: a file of blank lines has no data either.
+    if not content.strip():
+        raise UploadRejected(ErrorCode.EMPTY_FILE, "The file is empty.")
+
+    try:
+        # utf-8-sig drops the byte-order mark Excel writes when it exports CSV.
+        return content.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise UploadRejected(
+            ErrorCode.UNREADABLE_ENCODING,
+            "The file is not valid UTF-8 text. Export it as CSV UTF-8 and try again.",
+        ) from exc
+
+
+def validate_structure(csv_text: str) -> tuple[list[RawRow], int]:
+    """Check the header and split the body into rows.
+
+    Returns the rows, and how many lines were skipped for having the wrong
+    number of fields.
+    """
+    reader = csv.reader(io.StringIO(csv_text, newline=""))
+
+    try:
+        raw_header = next(reader)
+    except StopIteration as exc:
+        raise UploadRejected(ErrorCode.MISSING_HEADER, "The file has no header row.") from exc
+
+    header = [column.strip().lower() for column in raw_header]
+
+    repeated = sorted({column for column in header if header.count(column) > 1})
+    if repeated:
+        raise UploadRejected(
+            ErrorCode.DUPLICATE_COLUMNS,
+            f"The header repeats these columns: {', '.join(repeated)}.",
+            {"duplicated": repeated},
+        )
+
+    missing = [column for column in REQUIRED_COLUMNS if column not in header]
+    if missing:
+        raise UploadRejected(
+            ErrorCode.MISSING_COLUMNS,
+            f"The file is missing these columns: {', '.join(missing)}.",
+            {"missing": missing, "found": header, "required": list(REQUIRED_COLUMNS)},
+        )
+
+    # Extra columns are ignored rather than rejected: they cost nothing, and a
+    # file carrying one spare column is still perfectly usable.
+    width = len(raw_header)
+    rows: list[RawRow] = []
+    ragged = 0
+
+    for values in reader:
+        if not any(value.strip() for value in values):
+            continue
+        if len(values) != width:
+            ragged += 1
+            continue
+        rows.append(RawRow(line=reader.line_num, values=dict(zip(header, values)), raw=tuple(values)))
+
+    if not rows:
+        raise UploadRejected(
+            ErrorCode.NO_DATA_ROWS,
+            "The file has a header but no data rows.",
+            {"ragged_rows": ragged},
+        )
+
+    return rows, ragged
+
+
+# --------------------------------------------------------------------------
+# Cleaning, then duplicates
+#
+# Duplicates cannot be found on the raw text. The sample files write one and
+# the same check three different ways -- 2025-05-13T12:45:00Z, the Unix epoch
+# 1746938700, and an IST +05:30 offset -- so two lines describing a single
+# check look nothing alike as strings. Timestamps are converted to UTC first,
+# and only then are rows grouped by service and time slot.
+# --------------------------------------------------------------------------
+
+
+def _parse_timestamp(value: str, issues: Counter) -> datetime:
+    raw = value.strip()
+    if not raw:
+        raise RowError("timestamp is blank")
+
+    if raw.lstrip("-").isdigit():
+        issues["epoch_timestamps"] += 1
+        try:
+            return datetime.fromtimestamp(int(raw), tz=UTC)
+        except (OverflowError, OSError, ValueError) as exc:
+            raise RowError(f"timestamp {raw!r} is not a usable epoch value") from exc
+
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError as exc:
+        raise RowError(f"timestamp {raw!r} is not a readable date") from exc
+
+    if parsed.tzinfo is None:
+        issues["naive_timestamps"] += 1
+        return parsed.replace(tzinfo=UTC)
+
+    # An offset is converted, never stripped: dropping +05:30 shifts the check
+    # by 5.5 hours and can move it to the wrong day, or the wrong month.
+    if parsed.utcoffset():
+        issues["offset_timestamps"] += 1
+    return parsed.astimezone(UTC)
+
+
+def _parse_latency(value: str, unit: str, issues: Counter) -> Decimal | None:
+    raw = value.strip()
+    if not raw:
+        issues["blank_latency"] += 1
+        return None
+
+    key = unit.strip().lower()
+    if key not in LATENCY_MULTIPLIERS:
+        raise RowError(f"unknown latency unit {unit.strip()!r}")
+
+    try:
+        amount = Decimal(raw)
+    except InvalidOperation as exc:
+        raise RowError(f"latency {raw!r} is not a number") from exc
+
+    if not amount.is_finite():
+        raise RowError(f"latency {raw!r} is not a number")
+
+    # A negative latency is impossible, so it is treated as no reading at all.
+    if amount < 0:
+        issues["negative_latency"] += 1
+        return None
+
+    latency_ms = amount * LATENCY_MULTIPLIERS[key]
+    # Caught here rather than at insert time, so one absurd value costs its own
+    # row instead of the whole upload.
+    if latency_ms > MAX_LATENCY_MS:
+        raise RowError(f"latency {raw!r} {key} is larger than any real check")
+
+    if key == "s":
+        issues["latency_converted_from_seconds"] += 1
+    return latency_ms
+
+
+def _outcome(status_code: int, issues: Counter) -> str:
+    if 200 <= status_code < 400:
+        return "up"
+    if 500 <= status_code < 600:
+        return "down"
+    # 1xx, 4xx and the seeded 999 prove neither up nor down (decision D2).
+    issues["invalid_status_codes"] += 1
+    return "invalid"
+
+
+def _clean_row(row: RawRow, issues: Counter) -> CleanCheck:
+    service_id = row.values["service_id"].strip()
+    if not service_id:
+        raise RowError("service_id is blank")
+
+    agent_id = row.values["agent"].strip()
+    if not agent_id:
+        raise RowError("agent is blank")
+
+    checked_at = _parse_timestamp(row.values["timestamp"], issues)
+    # Once in UTC every timestamp lands on a 15-minute boundary. One that does
+    # not means the row was read wrongly, so it is not trusted.
+    if checked_at.microsecond or int(checked_at.timestamp()) % CHECK_INTERVAL_SECONDS:
+        raise RowError(f"{checked_at.isoformat()} is not on the 15-minute grid")
+
+    raw_code = row.values["status_code"].strip()
+    try:
+        status_code = int(raw_code)
+    except ValueError as exc:
+        raise RowError(f"status_code {raw_code!r} is not a number") from exc
+
+    # Same reason as the latency ceiling: a value the column cannot hold is
+    # this row's problem, not the file's.
+    if not MIN_STATUS_CODE <= status_code <= MAX_STATUS_CODE:
+        raise RowError(f"status_code {status_code} is outside {MIN_STATUS_CODE}-{MAX_STATUS_CODE}")
+
+    return CleanCheck(
+        line=row.line,
+        service_id=service_id,
+        service_name=row.values["service_name"].strip(),
+        checked_at=checked_at,
+        status_code=status_code,
+        outcome=_outcome(status_code, issues),
+        latency_ms=_parse_latency(row.values["latency"], row.values["latency_unit"], issues),
+        agent_id=agent_id,
+        region_id=row.values["region"].strip(),
+    )
+
+
+def clean_rows(rows: list[RawRow]) -> CleanResult:
+    """Clean every row, then keep one check per service per time slot."""
+    issues: Counter = Counter()
+    rejected: list[RejectedRowReport] = []
+    cleaned: list[CleanCheck] = []
+    seen_raw: set[tuple[str, ...]] = set()
+    exact_rows = 0
+
+    for row in rows:
+        try:
+            check = _clean_row(row, issues)
+        except RowError as exc:
+            if len(rejected) < MAX_REPORTED_REJECTIONS:
+                rejected.append(RejectedRowReport(line=row.line, reason=str(exc)))
+            continue
+
+        # Byte-for-byte repeats of an earlier line: noise, not a second opinion.
+        if row.raw in seen_raw:
+            exact_rows += 1
+        else:
+            seen_raw.add(row.raw)
+        cleaned.append(check)
+
+    if not cleaned:
+        raise UploadRejected(
+            ErrorCode.NO_VALID_ROWS,
+            "No row in the file could be read as a health check.",
+            {"rows_received": len(rows), "examples": [r.reason for r in rejected[:5]]},
+        )
+
+    slots: dict[tuple[str, datetime], list[CleanCheck]] = {}
+    for check in cleaned:
+        slots.setdefault((check.service_id, check.checked_at), []).append(check)
+
+    checks: list[CleanCheck] = []
+    conflicting = 0
+    for group in slots.values():
+        if len(group) > 1 and len({c.status_code for c in group}) > 1:
+            conflicting += 1
+        # Ties break on line order, so the first such row in the file wins.
+        checks.append(min(group, key=lambda c: (OUTCOME_PRIORITY[c.outcome], c.line)))
+
+    checks.sort(key=lambda c: (c.checked_at, c.service_id))
+
+    total = len(cleaned) - len(checks)
+    return CleanResult(
+        checks=checks,
+        rows_received=len(rows),
+        issues=issues,
+        duplicates=DuplicateReport(
+            total=total,
+            exact_rows=exact_rows,
+            same_slot_rows=total - exact_rows,
+            conflicting_slots=conflicting,
+        ),
+        rejected=rejected,
+    )
+
+
+# --------------------------------------------------------------------------
+# Saving
+#
+# The master rows come from the file itself rather than from a fixed seed, so
+# a service or agent nobody has seen before still uploads cleanly. A check is
+# only ever inserted once its service, agent and region exist, because
+# service_status_logs has foreign keys to all three.
+# --------------------------------------------------------------------------
+
+CHECK_COLUMNS = "file_id, service_id, checked_at, status_code, outcome, latency_ms, agent_id"
+
+# COPY cannot skip conflicting rows, so the checks land in a temp table first
+# and move across in one statement that can. The temp table disappears when the
+# transaction ends, whether it commits or rolls back.
+CREATE_STAGING = """
+CREATE TEMP TABLE staged_checks (
+    file_id bigint,
+    service_id text,
+    checked_at timestamptz,
+    status_code smallint,
+    outcome text,
+    latency_ms numeric(12, 3),
+    agent_id text
+) ON COMMIT DROP
+"""
+
+COPY_CHECKS = f"COPY staged_checks ({CHECK_COLUMNS}) FROM STDIN"
+
+# A slot already held for this file keeps the check that got there first; the
+# later one is skipped and the rest of the file still saves.
+INSERT_CHECKS = f"""
+INSERT INTO service_status_logs ({CHECK_COLUMNS})
+SELECT {CHECK_COLUMNS} FROM staged_checks
+ON CONFLICT (file_id, service_id, checked_at) DO NOTHING
+"""
+
+
+def _sync_master_rows(session: Session, checks: list[CleanCheck], warnings: list[str]) -> None:
+    regions = sorted({check.region_id for check in checks})
+    session.execute(pg_insert(Region).values([{"region_id": r} for r in regions]).on_conflict_do_nothing())
+
+    # One region per agent, one name per service. Both are assumptions the
+    # database depends on, so a file that breaks them is worth saying so about.
+    agent_regions: dict[str, set[str]] = {}
+    service_names: dict[str, set[str]] = {}
+    for check in checks:
+        agent_regions.setdefault(check.agent_id, set()).add(check.region_id)
+        service_names.setdefault(check.service_id, set()).add(check.service_name)
+
+    for agent_id, seen in sorted(agent_regions.items()):
+        if len(seen) > 1:
+            warnings.append(f"{agent_id} reported from more than one region: {', '.join(sorted(seen))}.")
+
+    for service_id, seen in sorted(service_names.items()):
+        if len(seen) > 1:
+            warnings.append(f"{service_id} appeared under more than one name: {', '.join(sorted(seen))}.")
+
+    session.execute(
+        pg_insert(Agent)
+        .values([{"agent_id": a, "region_id": sorted(r)[0]} for a, r in sorted(agent_regions.items())])
+        .on_conflict_do_nothing()
+    )
+
+    stored_names = dict(
+        session.execute(
+            select(Service.service_id, Service.service_name).where(Service.service_id.in_(service_names))
+        ).all()
+    )
+    for service_id, seen in sorted(service_names.items()):
+        stored = stored_names.get(service_id)
+        if stored and stored not in seen:
+            warnings.append(
+                f"{service_id} is stored as {stored!r} but this file calls it "
+                f"{sorted(seen)[0]!r}; the stored name was kept."
+            )
+
+    session.execute(
+        pg_insert(Service)
+        .values([{"service_id": s, "service_name": sorted(n)[0]} for s, n in sorted(service_names.items())])
+        .on_conflict_do_nothing()
+    )
+
+
+def save_upload(file_name: str, result: CleanResult, warnings: list[str]) -> int:
+    """Save the clean checks and return the new file_id."""
+    with Session(engine) as session:
+        _sync_master_rows(session, result.checks, warnings)
+        session.commit()
+
+        # Committed on its own, before the checks: if the insert below fails,
+        # this row survives to record that the upload was attempted.
+        uploaded = UploadedFile(file_name=file_name, status="processing", rows_received=0)
+        session.add(uploaded)
+        session.commit()
+        file_id = uploaded.file_id
+
+        try:
+            # COPY rather than an INSERT per check: a round trip to the
+            # database costs ~2 seconds, so 14,400 inserts take a minute while
+            # one COPY of the same rows takes under two.
+            session.execute(text(CREATE_STAGING))
+            raw_connection = session.connection().connection
+            with raw_connection.cursor() as cursor, cursor.copy(COPY_CHECKS) as copy:
+                for check in result.checks:
+                    copy.write_row(
+                        (
+                            file_id,
+                            check.service_id,
+                            check.checked_at,
+                            check.status_code,
+                            check.outcome,
+                            check.latency_ms,
+                            check.agent_id,
+                        )
+                    )
+
+            stored = session.execute(text(INSERT_CHECKS)).rowcount
+            skipped = len(result.checks) - stored
+            if skipped:
+                # Deduplication should have made this impossible, so it means a
+                # bug rather than messy data. Saying so beats saving quietly.
+                warnings.append(f"{skipped} check(s) landed on a slot this file had already filled, and were skipped.")
+
+            uploaded.rows_received = result.rows_received
+            uploaded.status = "done"
+            session.commit()
+        except Exception as exc:
+            # Roll the checks back, then record why on the row from step one.
+            # A half-saved file must never reach the dashboard, which only
+            # lists uploads with status 'done'.
+            session.rollback()
+            uploaded.status = "failed"
+            uploaded.error_message = str(exc)[:1000]
+            session.commit()
+            raise
+
+    return file_id
+
+
+# --------------------------------------------------------------------------
+# Report
+# --------------------------------------------------------------------------
+
+
+def build_report(
+    file_id: int, file_name: str, result: CleanResult, ragged: int, extra_warnings: list[str]
+) -> UploadReport:
+    start = result.checks[0].checked_at
+    end = result.checks[-1].checked_at
+    services = sorted({check.service_id for check in result.checks})
+    days = (end.date() - start.date()).days + 1
+    expected = len(services) * CHECKS_PER_DAY * days
+
+    coverage = Coverage(
+        start=start,
+        end=end,
+        days=days,
+        services=services,
+        expected_checks=expected,
+        # Never negative: an extra check would mean a slot was counted twice,
+        # which deduplication has already ruled out.
+        missing_checks=max(0, expected - len(result.checks)),
+    )
+
+    warnings: list[str] = list(extra_warnings)
+    if ragged:
+        warnings.append(f"{ragged} line(s) had the wrong number of fields and were skipped.")
+    if result.rejected:
+        warnings.append(f"{len(result.rejected)} row(s) could not be read and were skipped.")
+    if coverage.missing_checks:
+        warnings.append(
+            f"{coverage.missing_checks} expected check(s) are missing "
+            f"({len(services)} services x {CHECKS_PER_DAY} slots x {days} days)."
+        )
+    if result.duplicates.conflicting_slots:
+        warnings.append(
+            f"{result.duplicates.conflicting_slots} time slot(s) had agents reporting "
+            "different status codes; the more serious valid result was kept."
+        )
+
+    return UploadReport(
+        file_id=file_id,
+        file_name=file_name,
+        status="accepted_with_warnings" if warnings else "clean",
+        rows_received=result.rows_received,
+        clean_checks=len(result.checks),
+        rows_removed=result.rows_received - len(result.checks),
+        coverage=coverage,
+        duplicates=result.duplicates,
+        issues=IssueReport(**result.issues),
+        ragged_rows=ragged,
+        rejected_rows=result.rejected,
+        warnings=warnings,
+    )
+
+
+# --------------------------------------------------------------------------
+# Routes
+# --------------------------------------------------------------------------
 
 
 @app.get("/health")
@@ -20,3 +675,29 @@ def health_db() -> dict[str, str]:
     except SQLAlchemyError as exc:
         raise HTTPException(status_code=503, detail="Database unavailable") from exc
     return {"status": "ok"}
+
+
+@app.post("/uploads", response_model=UploadReport)
+async def create_upload(file: UploadFile = File(...)) -> UploadReport:
+    """Validate an uploaded CSV, clean it, save it, and report what was found."""
+    file_name = file.filename or ""
+    content = await file.read()
+
+    try:
+        csv_text = validate_file(file_name, content)
+        rows, ragged = validate_structure(csv_text)
+        result = clean_rows(rows)
+    except UploadRejected as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": exc.code.value, "message": exc.message, "details": exc.details},
+        ) from exc
+
+    warnings: list[str] = []
+    try:
+        file_id = save_upload(file_name, result, warnings)
+    except (SQLAlchemyError, psycopg.Error) as exc:
+        # COPY reports failures as psycopg errors, not SQLAlchemy ones.
+        raise HTTPException(status_code=503, detail="The file was read but could not be saved.") from exc
+
+    return build_report(file_id, file_name, result, ragged, warnings)
