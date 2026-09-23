@@ -8,21 +8,29 @@ import csv
 import io
 from collections import Counter
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from enum import Enum
 from typing import Literal
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from pydantic import BaseModel
 import psycopg
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.database import engine  # loads .env
-from app.models import Agent, Region, Service, UploadedFile
+from app.models import (
+    Agent,
+    Region,
+    Service,
+    ServiceStatusLog,
+    TestOutage,
+    TestOutageIncident,
+    UploadedFile,
+)
 
 app = FastAPI(title="SLA Monitoring API")
 
@@ -67,6 +75,18 @@ MAX_LATENCY_MS = Decimal("999999999.999")
 OUTCOME_PRIORITY = {"down": 0, "up": 1, "invalid": 2}
 
 MAX_REPORTED_REJECTIONS = 20
+
+# Decision D5: where one incident ends. A healthy check ends it, so every
+# stored incident is an unbroken run of failures and its range never covers a
+# check that passed. A flickering outage is therefore recorded as several
+# incidents: the seeded svc-reports outage on 2025-05-13 recovers for one slot
+# at 16:30, 17:00 and 17:45, and is stored as four rows rather than one.
+#
+# Raising this bridges that many healthy slots and merges those rows back into
+# one. At 2 (30 minutes) each of the 8 seeded outages reads as a single
+# incident, which is how dataset_incident_log.json describes them. Either way
+# the downtime is the same: only failed checks are ever counted.
+MAX_HEALTHY_GAP_SLOTS = 0
 
 
 class ErrorCode(str, Enum):
@@ -149,6 +169,33 @@ class UploadReport(BaseModel):
     ragged_rows: int
     rejected_rows: list[RejectedRowReport]
     warnings: list[str]
+
+
+class OutageIncident(BaseModel):
+    """One detected incident, on one service, within one day."""
+
+    service_id: str
+    day_index: int
+    checkpoint_start: int
+    checkpoint_end: int
+    started_at: datetime
+    ended_at: datetime
+    down_checks: int
+    downtime_minutes: int
+
+
+class OutageReport(BaseModel):
+    """What the outage scan found for one uploaded file."""
+
+    file_id: int
+    file_name: str
+    already_processed: bool
+    start_date: date
+    days: int
+    incidents_found: int
+    services_affected: list[str]
+    total_downtime_minutes: int
+    incidents: list[OutageIncident]
 
 
 # --------------------------------------------------------------------------
@@ -658,6 +705,200 @@ def build_report(
 
 
 # --------------------------------------------------------------------------
+# Outages
+#
+# An incident is a run of down checks on one service, taken from
+# service_status_logs. Nothing else feeds it: the checks in the database are
+# the only input, so the result always matches what was actually stored.
+#
+# test_outage_incidents describes an incident as a day and a range of
+# check-points within that day, so a run crossing midnight is split at the day
+# boundary and stored as one row per day.
+# --------------------------------------------------------------------------
+
+SLOT = timedelta(seconds=CHECK_INTERVAL_SECONDS)
+SLOT_MINUTES = CHECK_INTERVAL_SECONDS // 60
+
+# Ordered by service first, so one service's failures form one continuous run
+# regardless of what the other services were doing at the time.
+LOAD_DOWN_CHECKS = (
+    select(ServiceStatusLog.service_id, ServiceStatusLog.checked_at)
+    .where(ServiceStatusLog.outcome == "down")
+    .order_by(ServiceStatusLog.service_id, ServiceStatusLog.checked_at)
+)
+
+LOAD_COVERAGE = select(func.min(ServiceStatusLog.checked_at), func.max(ServiceStatusLog.checked_at))
+
+
+def _checkpoint(moment: datetime) -> int:
+    """Which of the day's 96 check-points a time falls on."""
+    return (moment.hour * 60 + moment.minute) // SLOT_MINUTES
+
+
+def _moment(start_date: date, day_index: int, checkpoint: int) -> datetime:
+    """The UTC time a stored day and check-point refer to."""
+    return datetime.combine(start_date, datetime.min.time(), UTC) + timedelta(
+        days=day_index, minutes=checkpoint * SLOT_MINUTES
+    )
+
+
+def detect_incidents(down_checks: list[tuple[str, datetime]], start_date: date) -> list[OutageIncident]:
+    """Group down checks into incidents, merging runs across short healthy gaps."""
+    runs: list[list[tuple[str, datetime]]] = []
+
+    for check in down_checks:
+        service_id, checked_at = check
+        if runs:
+            last_service, last_at = runs[-1][-1]
+            # The run continues while the healthy stretch since the last
+            # failure is within tolerance. A missing slot counts as healthy:
+            # no data is not a failure (decision D3).
+            if last_service == service_id and checked_at - last_at <= SLOT * (MAX_HEALTHY_GAP_SLOTS + 1):
+                runs[-1].append(check)
+                continue
+        runs.append([check])
+
+    incidents: list[OutageIncident] = []
+    for run in runs:
+        days: dict[int, list[datetime]] = {}
+        for _, checked_at in run:
+            days.setdefault((checked_at.date() - start_date).days, []).append(checked_at)
+
+        for day_index, moments in sorted(days.items()):
+            incidents.append(
+                OutageIncident(
+                    service_id=run[0][0],
+                    day_index=day_index,
+                    checkpoint_start=_checkpoint(moments[0]),
+                    checkpoint_end=_checkpoint(moments[-1]),
+                    started_at=moments[0],
+                    ended_at=moments[-1],
+                    down_checks=len(moments),
+                    # Downtime counts the failed checks, not the span: the
+                    # healthy checks inside a flickering outage were really up.
+                    downtime_minutes=len(moments) * SLOT_MINUTES,
+                )
+            )
+
+    incidents.sort(key=lambda incident: (incident.started_at, incident.service_id))
+    return incidents
+
+
+def _stored_incidents(session: Session, file_id: int, outage: TestOutage) -> list[OutageIncident]:
+    """Read back a scan done earlier."""
+    rows = session.execute(
+        select(TestOutageIncident)
+        .where(TestOutageIncident.file_name == outage.file_name)
+        .order_by(TestOutageIncident.day_index, TestOutageIncident.checkpoint_start)
+    ).scalars()
+
+    # A stored row keeps only the range, so downtime is counted from the checks
+    # themselves rather than from the range: the same file reports the same
+    # downtime whether it was just scanned or is being read back. The two agree
+    # exactly while a healthy check ends an incident, and still agree once
+    # MAX_HEALTHY_GAP_SLOTS is raised and a range can span one.
+    down_slots: set[tuple[str, datetime]] = {
+        (service_id, checked_at)
+        for service_id, checked_at in session.execute(LOAD_DOWN_CHECKS.where(ServiceStatusLog.file_id == file_id))
+    }
+
+    incidents = []
+    for row in rows:
+        started_at = _moment(outage.start_date, row.day_index, row.checkpoint_start)
+        ended_at = _moment(outage.start_date, row.day_index, row.checkpoint_end)
+        down_checks = sum(
+            (row.service_id, started_at + SLOT * step) in down_slots
+            for step in range(row.checkpoint_end - row.checkpoint_start + 1)
+        )
+        incidents.append(
+            OutageIncident(
+                service_id=row.service_id,
+                day_index=row.day_index,
+                checkpoint_start=row.checkpoint_start,
+                checkpoint_end=row.checkpoint_end,
+                started_at=started_at,
+                ended_at=ended_at,
+                down_checks=down_checks,
+                downtime_minutes=down_checks * SLOT_MINUTES,
+            )
+        )
+
+    return incidents
+
+
+def _outage_report(
+    file_id: int,
+    file_name: str,
+    already_processed: bool,
+    start_date: date,
+    days: int,
+    incidents: list[OutageIncident],
+) -> OutageReport:
+    return OutageReport(
+        file_id=file_id,
+        file_name=file_name,
+        already_processed=already_processed,
+        start_date=start_date,
+        days=days,
+        incidents_found=len(incidents),
+        services_affected=sorted({incident.service_id for incident in incidents}),
+        total_downtime_minutes=sum(incident.downtime_minutes for incident in incidents),
+        incidents=incidents,
+    )
+
+
+def scan_outages(file_id: int) -> OutageReport:
+    """Detect this file's incidents and store them, unless it is already done."""
+    with Session(engine) as session:
+        uploaded = session.get(UploadedFile, file_id)
+        if uploaded is None:
+            raise HTTPException(status_code=404, detail=f"No uploaded file with id {file_id}.")
+        if uploaded.status != "done":
+            raise HTTPException(
+                status_code=409,
+                detail=f"File {file_id} is {uploaded.status}; only a file that saved completely can be scanned.",
+            )
+        file_name = uploaded.file_name
+
+        # The outage tables are keyed by file name, so a file already scanned
+        # is read back rather than written a second time. That also covers the
+        # same file uploaded twice under two different file ids.
+        stored = session.get(TestOutage, file_name)
+        if stored is not None:
+            return _outage_report(
+                file_id, file_name, True, stored.start_date, stored.days, _stored_incidents(session, file_id, stored)
+            )
+
+        first, last = session.execute(LOAD_COVERAGE.where(ServiceStatusLog.file_id == file_id)).one()
+        if first is None:
+            raise HTTPException(status_code=409, detail=f"File {file_id} has no stored checks to scan.")
+
+        start_date = first.date()
+        days = (last.date() - start_date).days + 1
+        down_checks = [
+            (row.service_id, row.checked_at)
+            for row in session.execute(LOAD_DOWN_CHECKS.where(ServiceStatusLog.file_id == file_id))
+        ]
+        incidents = detect_incidents(down_checks, start_date)
+
+        # The parent row first: test_outage_incidents points at it by name.
+        session.add(TestOutage(file_name=file_name, days=days, start_date=start_date))
+        session.add_all(
+            TestOutageIncident(
+                file_name=file_name,
+                service_id=incident.service_id,
+                day_index=incident.day_index,
+                checkpoint_start=incident.checkpoint_start,
+                checkpoint_end=incident.checkpoint_end,
+            )
+            for incident in incidents
+        )
+        # One transaction, so the tables never hold a half-finished scan.
+        session.commit()
+
+    return _outage_report(file_id, file_name, False, start_date, days, incidents)
+
+# --------------------------------------------------------------------------
 # Routes
 # --------------------------------------------------------------------------
 
@@ -701,3 +942,12 @@ async def create_upload(file: UploadFile = File(...)) -> UploadReport:
         raise HTTPException(status_code=503, detail="The file was read but could not be saved.") from exc
 
     return build_report(file_id, file_name, result, ragged, warnings)
+
+
+@app.post("/outage", response_model=OutageReport)
+def create_outages(file_id: int = Query(..., ge=1, description="An uploaded file's id")) -> OutageReport:
+    """Detect the outages in an uploaded file's stored checks and save them."""
+    try:
+        return scan_outages(file_id)
+    except (SQLAlchemyError, psycopg.Error) as exc:
+        raise HTTPException(status_code=503, detail="The outages could not be read or saved.") from exc
