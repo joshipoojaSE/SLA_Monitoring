@@ -44,5 +44,68 @@ export function Skeleton({ className = '' }: { className?: string }) {
   return <div className={`animate-pulse rounded bg-slate-200 ${className}`} />
 }
 
+export type SortDir = 'asc' | 'desc'
+
+export interface SortState<K extends string> {
+  key: K
+  dir: SortDir
+}
+
+/** Clicking the active column reverses it; clicking another starts at that column's own first direction. */
+export function nextSort<K extends string>(current: SortState<K>, key: K, firstDir: SortDir): SortState<K> {
+  return current.key === key ? { key, dir: current.dir === 'asc' ? 'desc' : 'asc' } : { key, dir: firstDir }
+}
+
+/**
+ * Horizontal cell padding for every table: even on both sides, so a
+ * right-aligned column never sits flush against a left-aligned one, and flush
+ * with the card at the table's outer edges.
+ */
+export const cellX = 'px-3 first:pl-0 last:pr-0'
+
+interface SortHeaderProps<K extends string> {
+  label: ReactNode
+  sortKey: K
+  sort: SortState<K>
+  onSort: (key: K, firstDir: SortDir) => void
+  /** The direction a first click sorts in: the "worst" or "biggest" end first. */
+  firstDir?: SortDir
+  align?: 'left' | 'right'
+  title?: string
+  className?: string
+}
+
+export function SortHeader<K extends string>({
+  label,
+  sortKey,
+  sort,
+  onSort,
+  firstDir = 'asc',
+  align = 'left',
+  title,
+  className = `py-2 ${cellX}`,
+}: SortHeaderProps<K>) {
+  const active = sort.key === sortKey
+  return (
+    <th
+      className={`${className} font-medium ${align === 'right' ? 'text-right' : ''}`}
+      aria-sort={active ? (sort.dir === 'asc' ? 'ascending' : 'descending') : 'none'}
+      title={title}
+    >
+      {/* On a right-aligned column the arrow goes first, so the label's edge lines up with the numbers below. */}
+      <button
+        type="button"
+        onClick={() => onSort(sortKey, firstDir)}
+        className={`inline-flex items-center gap-1 uppercase tracking-wide hover:text-slate-800 ${align === 'right' ? 'flex-row-reverse' : ''} ${active ? 'text-slate-800' : ''}`}
+      >
+        {label}
+        <span aria-hidden className={active ? '' : 'text-slate-300'}>
+          {active ? (sort.dir === 'asc' ? '▲' : '▼') : '↕'}
+        </span>
+      </button>
+    </th>
+  )
+}
+
 export const selectClass =
   'rounded-md border border-slate-300 bg-white px-2.5 py-1.5 text-sm shadow-sm focus:border-slate-500 focus:outline-none focus:ring-1 focus:ring-slate-500'

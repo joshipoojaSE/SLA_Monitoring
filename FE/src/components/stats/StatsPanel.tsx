@@ -62,7 +62,7 @@ export function StatsPanel({ stats, isLoading, error, onSelectService, onSelectI
         {!expanded && stats && (
           <span className="truncate text-sm text-slate-600">
             {formatPct(stats.availability_pct)} overall · {stats.services_breaching} of {stats.services.length} below{' '}
-            {stats.sla_target_pct}% · {stats.incidents.length} incidents
+            {stats.sla_target_pct}% · {stats.incident_count} incidents
           </span>
         )}
       </button>
@@ -73,8 +73,8 @@ export function StatsPanel({ stats, isLoading, error, onSelectService, onSelectI
             <StateMessage tone="error">{error.message}</StateMessage>
           ) : isLoading || !stats ? (
             <div className="space-y-3">
-              <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
-                {Array.from({ length: 5 }, (_, index) => (
+              <div className="grid grid-cols-2 gap-3 xl:grid-cols-4">
+                {Array.from({ length: 4 }, (_, index) => (
                   <Skeleton key={index} className="h-20" />
                 ))}
               </div>
@@ -91,9 +91,15 @@ export function StatsPanel({ stats, isLoading, error, onSelectService, onSelectI
               )}
               <div>
                 <h3 className="mb-2 text-sm font-semibold">By service</h3>
-                <ServiceTable services={stats.services} onSelect={onSelectService} />
+                {/* Keyed by file, so switching files starts each table again from page 1. */}
+                <ServiceTable key={stats.file_id} fileId={stats.file_id} onSelect={onSelectService} />
               </div>
-              <IncidentTable incidents={stats.incidents} onSelect={onSelectIncident} />
+              <IncidentTable
+                key={stats.file_id}
+                fileId={stats.file_id}
+                count={stats.incident_count}
+                onSelect={onSelectIncident}
+              />
             </>
           )}
         </div>

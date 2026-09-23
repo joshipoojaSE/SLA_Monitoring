@@ -95,6 +95,12 @@ SLA_TARGET_PCT = 99.9
 
 MAX_LOG_PAGE_SIZE = 200
 
+LogSort = Literal["checked_at", "service", "status", "outcome", "latency", "agent", "region"]
+
+MAX_STATS_PAGE_SIZE = 100
+ServiceSort = Literal["service", "availability", "sla", "downtime", "incidents", "longest", "p95", "gaps"]
+IncidentSort = Literal["service", "started", "ended", "checks", "downtime"]
+
 # Comma-separated; the dashboard's dev server (FE/vite.config.ts) by default.
 CORS_ORIGINS = [
     origin.strip() for origin in os.getenv("CORS_ORIGINS", "http://localhost:5174").split(",") if origin.strip()
@@ -240,7 +246,8 @@ class ServiceStats(BaseModel):
 
 
 class DashboardStats(BaseModel):
-    """Everything the collapsible stats section shows for one file."""
+    """The headline figures for one file. The two tables page through their
+    rows separately; services stay here too, as the log filter lists them."""
 
     file_id: int
     file_name: str
@@ -249,13 +256,26 @@ class DashboardStats(BaseModel):
     coverage_start: datetime
     coverage_end: datetime
     days: int
-    expected_checks: int
-    stored_checks: int
     availability_pct: float | None
     services_breaching: int
     total_downtime_minutes: int
+    incident_count: int
+    longest_incident_minutes: int
     services: list[ServiceStats]
-    incidents: list[OutageIncident]
+
+
+class ServicePage(BaseModel):
+    total: int
+    page: int
+    page_size: int
+    items: list[ServiceStats]
+
+
+class IncidentPage(BaseModel):
+    total: int
+    page: int
+    page_size: int
+    items: list[OutageIncident]
 
 
 class LogRow(BaseModel):
@@ -1029,7 +1049,9 @@ def list_files() -> list[FileSummary]:
         ]
 
 
-def dashboard_stats(file_id: int) -> DashboardStats:
+def _file_stats(file_id: int) -> tuple[DashboardStats, list[OutageIncident]]:
+    """The headline figures and every incident for one file. Both come from
+    the per-service counts and the incidents, so they are worked out together."""
     with Session(engine) as session:
         uploaded = _stored_file(session, file_id)
 
@@ -1093,7 +1115,7 @@ def dashboard_stats(file_id: int) -> DashboardStats:
 
     total_up = sum(service.up_checks for service in services)
     total_down = sum(service.down_checks for service in services)
-    return DashboardStats(
+    summary = DashboardStats(
         file_id=file_id,
         file_name=uploaded.file_name,
         scanned=outage is not None,
@@ -1101,14 +1123,86 @@ def dashboard_stats(file_id: int) -> DashboardStats:
         coverage_start=first,
         coverage_end=last,
         days=days,
-        expected_checks=len(services) * CHECKS_PER_DAY * days,
-        stored_checks=sum(s.up_checks + s.down_checks + s.invalid_checks for s in services),
         availability_pct=_pct(total_up, total_up + total_down),
         services_breaching=sum(service.meets_sla is False for service in services),
         total_downtime_minutes=total_down * SLOT_MINUTES,
+        incident_count=len(incidents),
+        longest_incident_minutes=max((incident.downtime_minutes for incident in incidents), default=0),
         services=services,
-        incidents=incidents,
     )
+    return summary, incidents
+
+
+def dashboard_stats(file_id: int) -> DashboardStats:
+    return _file_stats(file_id)[0]
+
+
+def _sorted_page(items: list, value, tiebreak, order: str, page: int, page_size: int) -> tuple[int, list]:
+    """One page of rows sorted by `value`. Empty values stay last whichever
+    way it runs, and `tiebreak` keeps equal rows in a fixed order, so a row
+    never shows up on two pages."""
+    present = sorted((item for item in items if value(item) is not None), key=tiebreak)
+    empty = sorted((item for item in items if value(item) is None), key=tiebreak)
+    # Python's sort is stable, also in reverse, so ties keep the tiebreak order.
+    present.sort(key=value, reverse=order == "desc")
+    ordered = present + empty
+    start = (page - 1) * page_size
+    return len(ordered), ordered[start : start + page_size]
+
+
+# Breached (0) sorts before met (1); a service with no valid check has no verdict.
+SERVICE_SORT_VALUES = {
+    "service": lambda service: service.service_name,
+    "availability": lambda service: service.availability_pct,
+    "sla": lambda service: None if service.meets_sla is None else int(service.meets_sla),
+    "downtime": lambda service: service.downtime_minutes,
+    "incidents": lambda service: service.incidents,
+    "longest": lambda service: service.longest_incident_minutes,
+    "p95": lambda service: service.p95_latency_ms,
+    "gaps": lambda service: service.invalid_checks + service.missing_checks,
+}
+
+INCIDENT_SORT_VALUES = {
+    "service": lambda incident: incident.service_id,
+    "started": lambda incident: incident.started_at,
+    "ended": lambda incident: incident.ended_at,
+    "checks": lambda incident: incident.down_checks,
+    "downtime": lambda incident: incident.downtime_minutes,
+}
+
+
+def service_page(file_id: int, sort: ServiceSort, order: str, page: int, page_size: int) -> ServicePage:
+    # Service figures are worked out per request rather than stored, so the
+    # whole list is built and one page of it returned.
+    summary, _ = _file_stats(file_id)
+    total, items = _sorted_page(
+        summary.services, SERVICE_SORT_VALUES[sort], lambda service: service.service_id, order, page, page_size
+    )
+    return ServicePage(total=total, page=page, page_size=page_size, items=items)
+
+
+def incident_page(file_id: int, sort: IncidentSort, order: str, page: int, page_size: int) -> IncidentPage:
+    _, incidents = _file_stats(file_id)
+    total, items = _sorted_page(
+        incidents,
+        INCIDENT_SORT_VALUES[sort],
+        lambda incident: (incident.started_at, incident.service_id),
+        order,
+        page,
+        page_size,
+    )
+    return IncidentPage(total=total, page=page, page_size=page_size, items=items)
+
+
+LOG_SORT_COLUMNS = {
+    "checked_at": ServiceStatusLog.checked_at,
+    "service": ServiceStatusLog.service_id,
+    "status": ServiceStatusLog.status_code,
+    "outcome": ServiceStatusLog.outcome,
+    "latency": ServiceStatusLog.latency_ms,
+    "agent": ServiceStatusLog.agent_id,
+    "region": Agent.region_id,
+}
 
 
 def read_logs(
@@ -1119,6 +1213,8 @@ def read_logs(
     outcome: str | None,
     page: int,
     page_size: int,
+    sort: LogSort = "checked_at",
+    order: Literal["asc", "desc"] = "asc",
 ) -> LogPage:
     """One page of stored checks. Dates are whole UTC days, both inclusive."""
     if date_from and date_to and date_to < date_from:
@@ -1134,6 +1230,7 @@ def read_logs(
         conditions.append(ServiceStatusLog.service_id == service_id)
     if outcome:
         conditions.append(ServiceStatusLog.outcome == outcome)
+    sort_column = LOG_SORT_COLUMNS[sort]
 
     with Session(engine) as session:
         _stored_file(session, file_id)
@@ -1142,7 +1239,13 @@ def read_logs(
             select(ServiceStatusLog, Agent.region_id)
             .join(Agent, Agent.agent_id == ServiceStatusLog.agent_id)
             .where(*conditions)
-            .order_by(ServiceStatusLog.checked_at, ServiceStatusLog.service_id)
+            # Empty values last either way; time then service break ties, so a
+            # row never shows up on two pages.
+            .order_by(
+                sort_column.desc().nulls_last() if order == "desc" else sort_column.asc().nulls_last(),
+                ServiceStatusLog.checked_at,
+                ServiceStatusLog.service_id,
+            )
             .offset((page - 1) * page_size)
             .limit(page_size)
         ).all()
@@ -1246,6 +1349,36 @@ def get_stats(file_id: int) -> DashboardStats:
         raise HTTPException(status_code=503, detail="The stats could not be read.") from exc
 
 
+@app.get("/files/{file_id}/stats/services", response_model=ServicePage)
+def get_service_stats(
+    file_id: int,
+    sort: ServiceSort = "availability",
+    order: Literal["asc", "desc"] = "asc",
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=MAX_STATS_PAGE_SIZE),
+) -> ServicePage:
+    """The per-service figures, sorted and paged. Worst availability first by default."""
+    try:
+        return service_page(file_id, sort, order, page, page_size)
+    except (SQLAlchemyError, psycopg.Error) as exc:
+        raise HTTPException(status_code=503, detail="The service stats could not be read.") from exc
+
+
+@app.get("/files/{file_id}/stats/incidents", response_model=IncidentPage)
+def get_incidents(
+    file_id: int,
+    sort: IncidentSort = "downtime",
+    order: Literal["asc", "desc"] = "desc",
+    page: int = Query(1, ge=1),
+    page_size: int = Query(10, ge=1, le=MAX_STATS_PAGE_SIZE),
+) -> IncidentPage:
+    """The file's incidents, sorted and paged. Longest first by default."""
+    try:
+        return incident_page(file_id, sort, order, page, page_size)
+    except (SQLAlchemyError, psycopg.Error) as exc:
+        raise HTTPException(status_code=503, detail="The incidents could not be read.") from exc
+
+
 @app.get("/files/{file_id}/logs", response_model=LogPage)
 def get_logs(
     file_id: int,
@@ -1255,9 +1388,11 @@ def get_logs(
     outcome: Literal["up", "down", "invalid"] | None = None,
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=MAX_LOG_PAGE_SIZE),
+    sort: LogSort = "checked_at",
+    order: Literal["asc", "desc"] = "asc",
 ) -> LogPage:
-    """The stored checks behind the stats, filtered and paged."""
+    """The stored checks behind the stats, filtered, sorted and paged."""
     try:
-        return read_logs(file_id, date_from, date_to, service_id, outcome, page, page_size)
+        return read_logs(file_id, date_from, date_to, service_id, outcome, page, page_size, sort, order)
     except (SQLAlchemyError, psycopg.Error) as exc:
         raise HTTPException(status_code=503, detail="The logs could not be read.") from exc

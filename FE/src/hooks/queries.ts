@@ -1,6 +1,6 @@
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from '../api/client'
-import type { LogFilters } from '../api/types'
+import type { IncidentSort, LogFilters, ServiceSort, TableQuery } from '../api/types'
 
 export const useFiles = () => useQuery({ queryKey: ['files'], queryFn: api.files })
 
@@ -17,6 +17,21 @@ export const useLogs = (fileId: number | undefined, filters: LogFilters) =>
     queryFn: () => api.logs(fileId!, filters),
     enabled: fileId !== undefined,
     // Keep the current page on screen while the next one loads.
+    placeholderData: keepPreviousData,
+  })
+
+// Both sit under ['stats', fileId], so anything that refreshes a file's stats refreshes the tables too.
+export const useServicePage = (fileId: number, query: TableQuery<ServiceSort>) =>
+  useQuery({
+    queryKey: ['stats', fileId, 'services', query],
+    queryFn: () => api.services(fileId, query),
+    placeholderData: keepPreviousData,
+  })
+
+export const useIncidentPage = (fileId: number, query: TableQuery<IncidentSort>) =>
+  useQuery({
+    queryKey: ['stats', fileId, 'incidents', query],
+    queryFn: () => api.incidents(fileId, query),
     placeholderData: keepPreviousData,
   })
 

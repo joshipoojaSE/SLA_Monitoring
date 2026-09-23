@@ -47,14 +47,34 @@ export interface DashboardStats {
   coverage_start: string
   coverage_end: string
   days: number
-  expected_checks: number
-  stored_checks: number
   availability_pct: number | null
   services_breaching: number
   total_downtime_minutes: number
+  incident_count: number
+  longest_incident_minutes: number
   services: ServiceStats[]
-  incidents: OutageIncident[]
 }
+
+/** One server-side page of a table. */
+export interface Page<T> {
+  total: number
+  page: number
+  page_size: number
+  items: T[]
+}
+
+export type SortOrder = 'asc' | 'desc'
+
+/** Sort and page for the two stats tables, which fetch their rows on their own. */
+export interface TableQuery<K extends string> {
+  sort: K
+  order: SortOrder
+  page: number
+  pageSize: number
+}
+
+export type ServiceSort = 'service' | 'availability' | 'sla' | 'downtime' | 'incidents' | 'longest' | 'p95' | 'gaps'
+export type IncidentSort = 'service' | 'started' | 'ended' | 'checks' | 'downtime'
 
 export interface LogRow {
   checked_at: string
@@ -66,18 +86,17 @@ export interface LogRow {
   region_id: string
 }
 
-export interface LogPage {
-  total: number
-  page: number
-  page_size: number
-  items: LogRow[]
-}
+export type LogPage = Page<LogRow>
+
+export type LogSort = 'checked_at' | 'service' | 'status' | 'outcome' | 'latency' | 'agent' | 'region'
 
 export interface LogFilters {
   dateFrom?: string
   dateTo?: string
   serviceId?: string
   outcome?: Outcome
+  sort: LogSort
+  order: SortOrder
   page: number
   pageSize: number
 }

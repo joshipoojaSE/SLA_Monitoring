@@ -9,9 +9,6 @@ interface Tile {
 }
 
 export function KpiTiles({ stats }: { stats: DashboardStats }) {
-  const longest = Math.max(0, ...stats.incidents.map((incident) => incident.downtime_minutes))
-  const invalid = stats.services.reduce((sum, service) => sum + service.invalid_checks, 0)
-  const missing = stats.services.reduce((sum, service) => sum + service.missing_checks, 0)
   const breaching = stats.services_breaching
 
   const tiles: Tile[] = [
@@ -34,20 +31,13 @@ export function KpiTiles({ stats }: { stats: DashboardStats }) {
     },
     {
       label: 'Incidents',
-      value: formatNumber(stats.incidents.length),
-      detail: `Longest ${formatMinutes(longest)}`,
-    },
-    {
-      label: 'Data completeness',
-      value: formatPct((stats.stored_checks * 100) / stats.expected_checks, 2),
-      detail: `${formatNumber(missing)} missing · ${formatNumber(invalid)} invalid`,
-      // Invalid checks are stored and listed, so only gaps count against completeness.
-      alert: missing > 0,
+      value: formatNumber(stats.incident_count),
+      detail: `Longest ${formatMinutes(stats.longest_incident_minutes)}`,
     },
   ]
 
   return (
-    <dl className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-5">
+    <dl className="grid grid-cols-2 gap-3 xl:grid-cols-4">
       {tiles.map((tile) => (
         <div
           key={tile.label}

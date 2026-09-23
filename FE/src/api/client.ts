@@ -1,4 +1,17 @@
-import type { DashboardStats, FileSummary, LogFilters, LogPage, OutageReport, UploadReport } from './types'
+import type {
+  DashboardStats,
+  FileSummary,
+  IncidentSort,
+  LogFilters,
+  LogPage,
+  OutageIncident,
+  OutageReport,
+  Page,
+  ServiceSort,
+  ServiceStats,
+  TableQuery,
+  UploadReport,
+} from './types'
 
 const API_URL = (import.meta.env.VITE_API_URL ?? 'http://localhost:8001').replace(/\/$/, '')
 
@@ -36,13 +49,33 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return body as T
 }
 
+function tableParams(query: TableQuery<string>): URLSearchParams {
+  return new URLSearchParams({
+    sort: query.sort,
+    order: query.order,
+    page: String(query.page),
+    page_size: String(query.pageSize),
+  })
+}
+
 export const api = {
   files: () => request<FileSummary[]>('/files'),
 
   stats: (fileId: number) => request<DashboardStats>(`/files/${fileId}/stats`),
 
+  services: (fileId: number, query: TableQuery<ServiceSort>) =>
+    request<Page<ServiceStats>>(`/files/${fileId}/stats/services?${tableParams(query)}`),
+
+  incidents: (fileId: number, query: TableQuery<IncidentSort>) =>
+    request<Page<OutageIncident>>(`/files/${fileId}/stats/incidents?${tableParams(query)}`),
+
   logs: (fileId: number, filters: LogFilters) => {
-    const params = new URLSearchParams({ page: String(filters.page), page_size: String(filters.pageSize) })
+    const params = new URLSearchParams({
+      page: String(filters.page),
+      page_size: String(filters.pageSize),
+      sort: filters.sort,
+      order: filters.order,
+    })
     if (filters.dateFrom) params.set('date_from', filters.dateFrom)
     if (filters.dateTo) params.set('date_to', filters.dateTo)
     if (filters.serviceId) params.set('service_id', filters.serviceId)

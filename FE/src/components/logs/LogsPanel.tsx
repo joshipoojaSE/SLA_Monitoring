@@ -1,10 +1,10 @@
 import type { DashboardStats, LogPage } from '../../api/types'
 import type { DashboardParams } from '../../hooks/useDashboardParams'
 import { utcDay } from '../../lib/format'
-import { Card, Skeleton, Spinner, StateMessage } from '../ui'
+import { Card, nextSort, Skeleton, Spinner, StateMessage } from '../ui'
 import { LogFilters } from './LogFilters'
 import { LogsTable } from './LogsTable'
-import { Pagination } from './Pagination'
+import { Pagination } from '../Pagination'
 
 interface Props {
   params: DashboardParams
@@ -44,12 +44,22 @@ export function LogsPanel({ params, stats, logs, isLoading, isFetching, error, o
           <StateMessage>No checks match these filters.</StateMessage>
         ) : (
           <>
-            <LogsTable rows={logs.items} />
+            <LogsTable
+              rows={logs.items}
+              sort={{ key: params.sort, dir: params.order }}
+              onSort={(key, firstDir) => {
+                // A new order starts again from page 1.
+                const next = nextSort({ key: params.sort, dir: params.order }, key, firstDir)
+                onChange({ sort: next.key, order: next.dir })
+              }}
+            />
             <Pagination
               page={logs.page}
               pageSize={logs.page_size}
               total={logs.total}
+              noun="checks"
               onPage={(page) => onChange({ page })}
+              onPageSize={(pageSize) => onChange({ pageSize })}
             />
           </>
         )}
