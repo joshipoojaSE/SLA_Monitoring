@@ -95,9 +95,9 @@ SLA_TARGET_PCT = 99.9
 
 MAX_LOG_PAGE_SIZE = 200
 
-# Comma-separated; the Vite dev server by default.
+# Comma-separated; the dashboard's dev server (FE/vite.config.ts) by default.
 CORS_ORIGINS = [
-    origin.strip() for origin in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",") if origin.strip()
+    origin.strip() for origin in os.getenv("CORS_ORIGINS", "http://localhost:5174").split(",") if origin.strip()
 ]
 
 

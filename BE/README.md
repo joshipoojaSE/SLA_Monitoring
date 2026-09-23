@@ -20,7 +20,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Copy `.env.example` to `.env` and set `DATABASE_URL`: the Neon connection string, pooled endpoint, `sslmode=require` (the libpq spelling, not `ssl=require`). Set `CORS_ORIGINS` to the dashboard's origin(s), comma-separated; it defaults to the Vite dev server, `http://localhost:5173`.
+Copy `.env.example` to `.env` and set `DATABASE_URL`: the Neon connection string, pooled endpoint, `sslmode=require` (the libpq spelling, not `ssl=require`). Set `CORS_ORIGINS` to the dashboard's origin(s), comma-separated; it defaults to the dashboard's dev server, `http://localhost:5174`.
 
 ## Database
 

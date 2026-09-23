@@ -10,10 +10,10 @@ Vite + React 19 + TypeScript, TanStack Query for fetching and caching, React Rou
 cd FE
 npm install
 cp .env.example .env   # set VITE_API_URL to the API's base URL
-npm run dev            # http://localhost:5173
+npm run dev            # http://localhost:5174
 ```
 
-The API must allow this origin: set `CORS_ORIGINS` in `BE/.env` (it defaults to `http://localhost:5173`).
+The API must allow this origin: set `CORS_ORIGINS` in `BE/.env` (it defaults to `http://localhost:5174`, the port `vite.config.ts` pins).
 
 `npm run build` type-checks and writes a static site to `dist/`.
 
