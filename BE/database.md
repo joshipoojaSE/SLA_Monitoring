@@ -159,7 +159,7 @@ Design notes:
 
 ## 6. Outage scan tables
 
-`POST /outage?file_id=…` finds the incidents in one uploaded file's `service_status_logs` and stores them here. The input is only the stored checks, never `dataset_incident_log.json`.
+Every upload finds the incidents in its own `service_status_logs` and stores them here, in the same transaction that saves the checks (section 8). The input is only the stored checks, never `dataset_incident_log.json`. The dashboard reads incidents only from these tables; it never works them out from the checks per request.
 
 Both tables are keyed by `file_id`, not file name. File names repeat (the same CSV uploaded twice, or a corrected file under the same name), and each upload is its own dataset with its own scan. Deleting an upload deletes its scan with it.
 
@@ -194,8 +194,11 @@ An incident that runs past midnight is stored as one row per day, because a row 
 | Start time | `checkpoint_start` × 15 minutes | 64 × 15 = 16:00 UTC |
 | Last failing check | `checkpoint_end` × 15 minutes | 69 × 15 = 17:15 UTC |
 | Expected clean checks | `days` × 96 × 5 services | 9 × 96 × 5 = 4,320 |
+| Failed checks, downtime | (`checkpoint_end` − `checkpoint_start` + 1), × 15 minutes | 69 − 64 + 1 = 6 → 90 min |
 
-**How the data gets in:** written by the outage scan, once per file. Scanning a file again reads the stored rows back instead of writing them twice.
+The last row holds because a healthy check always ends an incident (`MAX_HEALTHY_GAP_SLOTS = 0`), so every slot in a stored range failed.
+
+**How the data gets in:** written once per file, as part of the upload. `POST /outage?file_id=…` reads the stored rows back, and scans only an upload saved before scanning was part of the upload.
 
 ---
 
@@ -233,7 +236,7 @@ These services and agents are the ones found in the sample files. New ones in a 
     - otherwise keep the first line.
 
     Every other line in the group is dropped as a duplicate.
-5. Save one `service_status_logs` row per group, save `rows_received` on the `uploaded_files` row, and set its status to `done`.
+5. Save one `service_status_logs` row per group, detect the incidents in those saved checks and save them to `test_outages` + `test_outage_incidents` (section 6), save `rows_received` on the `uploaded_files` row, and set its status to `done`.
 6. **Commit the transaction.**
 
 If anything fails in steps 2–6, the transaction is rolled back, so no checks from this file are saved. The `uploaded_files` row still exists from step 1, and is then updated to status `failed` with an `error_message`. A half-saved file can never appear on the dashboard, because the file selector only shows uploaded files with status `done`.
@@ -273,7 +276,7 @@ Both lines describe the same check: search-api at 12:15 UTC on 14 April. One tim
 | Downtime | same | Failed checks × 15 minutes |
 | Best-case month | same | (days in month × 96 − failed) ÷ (days in month × 96) × 100 |
 | SLA status | calculated above | Best case < 99.9% → Breached (confirmed); full month ≥ 99.9% → Met; otherwise Met so far (provisional) |
-| Incidents | `service_status_logs` | Runs of down checks on one service, merged across short gaps (decision D5) |
+| Incidents | `test_outage_incidents` | Stored at upload as runs of down checks on one service (decision D5); sorted and paged by the database |
 | Latency p50 / p95 / max | `service_status_logs.latency_ms` | Ignoring empty values |
 | Data quality section | `uploaded_files` + `service_status_logs` | Rows received, clean checks (count of `service_status_logs`), and lines removed (received − clean) |
 | Missing checks | `service_status_logs` | Every expected 15-minute slot with no check |
@@ -288,10 +291,9 @@ Both lines describe the same check: search-api at 12:15 UTC on 14 April. One tim
 | Original CSV lines | Not required by the assignment. Data findings are described in the README; only `rows_received` is kept on `uploaded_files` |
 | Rejected lines | Not stored or counted separately; they're included in "lines removed". Acceptable because none of the sample files has a rejected line |
 | Availability, downtime, SLA status | Calculated from `service_status_logs`, so they can never go stale |
-| Incidents | Calculated from runs of down checks |
 | Date range on `uploaded_files` | Calculated from `service_status_logs` |
 | `latency_unit` on clean checks | Everything is in ms |
 | `service_name` and `region` on each check | Stored once in `services` and `agents` |
 | `dataset_incident_log.json` | Not loaded. Every incident comes from the stored checks |
 
-**Trade-off:** calculating on every request is slower than reading saved numbers, but with at most ~15,000 checks per file it stays well under a second. With millions of rows, the SLA summary would be pre-calculated after each upload instead.
+**Trade-off:** incidents are stored at upload, so the dashboard never re-scans the checks for them. The per-service counts and latencies are still one aggregate over the file's checks; the API keeps that result in memory per file (a file's checks never change), so it runs once per file per server process rather than on every request. With millions of rows per file, that summary would be stored after each upload instead.

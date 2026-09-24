@@ -12,8 +12,11 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from enum import Enum
+from functools import lru_cache
 from typing import Literal
 
+import boto3
+from botocore.exceptions import BotoCoreError, ClientError
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -87,7 +90,9 @@ MAX_REPORTED_REJECTIONS = 20
 # Raising this bridges that many healthy slots and merges those rows back into
 # one. At 2 (30 minutes) each of the 8 seeded outages reads as a single
 # incident, which is how dataset_incident_log.json describes them. Either way
-# the downtime is the same: only failed checks are ever counted.
+# the downtime is the same: only failed checks are ever counted. Stored
+# incidents are read back assuming 0, though (see INCIDENT_LENGTH), so raising
+# it means storing each incident's failed-check count as well.
 MAX_HEALTHY_GAP_SLOTS = 0
 
 # The SLA from the brief: monthly availability below 99.9% earns a credit.
@@ -105,6 +110,11 @@ IncidentSort = Literal["service", "started", "ended", "checks", "downtime"]
 CORS_ORIGINS = [
     origin.strip() for origin in os.getenv("CORS_ORIGINS", "http://localhost:5174").split(",") if origin.strip()
 ]
+
+# Every raw upload is kept at s3://S3_BUCKET/<file_id>/<file name>. Credentials
+# come from the usual AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY variables.
+S3_BUCKET = os.getenv("S3_BUCKET", "")
+AWS_REGION = os.getenv("AWS_REGION") or None
 
 
 class ErrorCode(str, Enum):
@@ -688,8 +698,27 @@ def _sync_master_rows(session: Session, checks: list[CleanCheck], warnings: list
     )
 
 
-def save_upload(file_name: str, result: CleanResult, warnings: list[str]) -> int:
-    """Save the clean checks and return the new file_id."""
+@lru_cache(maxsize=1)
+def _s3():
+    return boto3.client("s3", region_name=AWS_REGION)
+
+
+def store_raw_file(file_id: int, file_name: str, content: bytes) -> None:
+    """Keep the file exactly as uploaded, in a folder named after its file_id.
+
+    S3 has no real folders: the "<file_id>/" key prefix is what shows as one."""
+    if not S3_BUCKET:
+        raise RuntimeError("S3_BUCKET is not set.")
+    _s3().put_object(
+        Bucket=S3_BUCKET,
+        Key=f"{file_id}/{os.path.basename(file_name)}",
+        Body=content,
+        ContentType="text/csv",
+    )
+
+
+def save_upload(file_name: str, content: bytes, result: CleanResult, warnings: list[str]) -> int:
+    """Store the raw file in S3, save the clean checks and return the new file_id."""
     with Session(engine) as session:
         _sync_master_rows(session, result.checks, warnings)
         session.commit()
@@ -702,6 +731,10 @@ def save_upload(file_name: str, result: CleanResult, warnings: list[str]) -> int
         file_id = uploaded.file_id
 
         try:
+            # First, so the raw file of an upload that fails below is still
+            # there to look at. No S3 copy, no upload: the file is marked failed.
+            store_raw_file(file_id, file_name, content)
+
             # COPY rather than an INSERT per check: a round trip to the
             # database costs ~2 seconds, so 14,400 inserts take a minute while
             # one COPY of the same rows takes under two.
@@ -727,6 +760,11 @@ def save_upload(file_name: str, result: CleanResult, warnings: list[str]) -> int
                 # Deduplication should have made this impossible, so it means a
                 # bug rather than messy data. Saying so beats saving quietly.
                 warnings.append(f"{skipped} check(s) landed on a slot this file had already filled, and were skipped.")
+
+            # Scanned in the same transaction as the checks, so a file the
+            # dashboard lists always has its incidents stored: the dashboard
+            # reads them from here and never works them out per request.
+            _record_outages(session, file_id)
 
             uploaded.rows_received = result.rows_received
             uploaded.status = "done"
@@ -881,47 +919,66 @@ def detect_incidents(down_checks: list[tuple[str, datetime]], start_date: date) 
     return incidents
 
 
+# A stored row keeps only its range. While a healthy check ends every incident
+# (MAX_HEALTHY_GAP_SLOTS = 0), each slot in that range failed, so the range's
+# length is the number of failed checks and the checks never need reading
+# again. Raising the gap would break this: the count would then have to be
+# stored, or recounted from service_status_logs.
+INCIDENT_LENGTH = TestOutageIncident.checkpoint_end - TestOutageIncident.checkpoint_start + 1
+
+
+def _as_incident(row: TestOutageIncident, start_date: date) -> OutageIncident:
+    down_checks = row.checkpoint_end - row.checkpoint_start + 1
+    return OutageIncident(
+        service_id=row.service_id,
+        day_index=row.day_index,
+        checkpoint_start=row.checkpoint_start,
+        checkpoint_end=row.checkpoint_end,
+        started_at=_moment(start_date, row.day_index, row.checkpoint_start),
+        ended_at=_moment(start_date, row.day_index, row.checkpoint_end),
+        down_checks=down_checks,
+        downtime_minutes=down_checks * SLOT_MINUTES,
+    )
+
+
 def _stored_incidents(session: Session, outage: TestOutage) -> list[OutageIncident]:
     """Read back a scan done earlier."""
-    file_id = outage.file_id
     rows = session.execute(
         select(TestOutageIncident)
-        .where(TestOutageIncident.file_id == file_id)
-        .order_by(TestOutageIncident.day_index, TestOutageIncident.checkpoint_start)
+        .where(TestOutageIncident.file_id == outage.file_id)
+        .order_by(TestOutageIncident.day_index, TestOutageIncident.checkpoint_start, TestOutageIncident.service_id)
     ).scalars()
+    return [_as_incident(row, outage.start_date) for row in rows]
 
-    # A stored row keeps only the range, so downtime is counted from the checks
-    # themselves rather than from the range: the same file reports the same
-    # downtime whether it was just scanned or is being read back. The two agree
-    # exactly while a healthy check ends an incident, and still agree once
-    # MAX_HEALTHY_GAP_SLOTS is raised and a range can span one.
-    down_slots: set[tuple[str, datetime]] = {
-        (service_id, checked_at)
-        for service_id, checked_at in session.execute(LOAD_DOWN_CHECKS.where(ServiceStatusLog.file_id == file_id))
-    }
 
-    incidents = []
-    for row in rows:
-        started_at = _moment(outage.start_date, row.day_index, row.checkpoint_start)
-        ended_at = _moment(outage.start_date, row.day_index, row.checkpoint_end)
-        down_checks = sum(
-            (row.service_id, started_at + SLOT * step) in down_slots
-            for step in range(row.checkpoint_end - row.checkpoint_start + 1)
+def _record_outages(session: Session, file_id: int) -> tuple[date, int, list[OutageIncident]]:
+    """Detect a file's incidents from its stored checks and add them to the
+    session. Nothing is committed here: the caller decides the transaction."""
+    first, last = session.execute(LOAD_COVERAGE.where(ServiceStatusLog.file_id == file_id)).one()
+    if first is None:
+        raise HTTPException(status_code=409, detail=f"File {file_id} has no stored checks to scan.")
+
+    start_date = first.date()
+    days = (last.date() - start_date).days + 1
+    down_checks = [
+        (row.service_id, row.checked_at)
+        for row in session.execute(LOAD_DOWN_CHECKS.where(ServiceStatusLog.file_id == file_id))
+    ]
+    incidents = detect_incidents(down_checks, start_date)
+
+    # The parent row first: test_outage_incidents points at it.
+    session.add(TestOutage(file_id=file_id, days=days, start_date=start_date))
+    session.add_all(
+        TestOutageIncident(
+            file_id=file_id,
+            service_id=incident.service_id,
+            day_index=incident.day_index,
+            checkpoint_start=incident.checkpoint_start,
+            checkpoint_end=incident.checkpoint_end,
         )
-        incidents.append(
-            OutageIncident(
-                service_id=row.service_id,
-                day_index=row.day_index,
-                checkpoint_start=row.checkpoint_start,
-                checkpoint_end=row.checkpoint_end,
-                started_at=started_at,
-                ended_at=ended_at,
-                down_checks=down_checks,
-                downtime_minutes=down_checks * SLOT_MINUTES,
-            )
-        )
-
-    return incidents
+        for incident in incidents
+    )
+    return start_date, days, incidents
 
 
 def _outage_report(
@@ -946,7 +1003,9 @@ def _outage_report(
 
 
 def scan_outages(file_id: int) -> OutageReport:
-    """Detect this file's incidents and store them, unless it is already done."""
+    """Detect this file's incidents and store them, unless it is already done.
+    Every upload is scanned as it saves, so this mostly reads a scan back; it
+    still scans an upload saved before that was the case."""
     with Session(engine) as session:
         uploaded = session.get(UploadedFile, file_id)
         if uploaded is None:
@@ -967,30 +1026,7 @@ def scan_outages(file_id: int) -> OutageReport:
                 file_id, file_name, True, stored.start_date, stored.days, _stored_incidents(session, stored)
             )
 
-        first, last = session.execute(LOAD_COVERAGE.where(ServiceStatusLog.file_id == file_id)).one()
-        if first is None:
-            raise HTTPException(status_code=409, detail=f"File {file_id} has no stored checks to scan.")
-
-        start_date = first.date()
-        days = (last.date() - start_date).days + 1
-        down_checks = [
-            (row.service_id, row.checked_at)
-            for row in session.execute(LOAD_DOWN_CHECKS.where(ServiceStatusLog.file_id == file_id))
-        ]
-        incidents = detect_incidents(down_checks, start_date)
-
-        # The parent row first: test_outage_incidents points at it.
-        session.add(TestOutage(file_id=file_id, days=days, start_date=start_date))
-        session.add_all(
-            TestOutageIncident(
-                file_id=file_id,
-                service_id=incident.service_id,
-                day_index=incident.day_index,
-                checkpoint_start=incident.checkpoint_start,
-                checkpoint_end=incident.checkpoint_end,
-            )
-            for incident in incidents
-        )
+        start_date, days, incidents = _record_outages(session, file_id)
         # One transaction, so the tables never hold a half-finished scan.
         session.commit()
 
@@ -1050,17 +1086,17 @@ def list_files() -> list[FileSummary]:
         ]
 
 
-def _file_stats(file_id: int) -> tuple[DashboardStats, list[OutageIncident]]:
-    """The headline figures and every incident for one file. Both come from
-    the per-service counts and the incidents, so they are worked out together."""
+@lru_cache(maxsize=32)
+def _check_totals(file_id: int) -> tuple[datetime, datetime, tuple]:
+    """A file's coverage and per-service counts and latencies: the one read
+    over all of its checks. A file's checks never change once it has saved
+    (a new upload gets a new file_id), so it is read once per file and kept,
+    rather than again for the stats and again for the service table. Callers
+    check the upload still exists first, so a deleted file is never served."""
     with Session(engine) as session:
-        uploaded = _stored_file(session, file_id)
-
         first, last = session.execute(LOAD_COVERAGE.where(ServiceStatusLog.file_id == file_id)).one()
         if first is None:
             raise HTTPException(status_code=404, detail=f"File {file_id} has no stored checks.")
-        start_date = first.date()
-        days = (last.date() - start_date).days + 1
 
         per_service = session.execute(
             select(
@@ -1078,21 +1114,33 @@ def _file_stats(file_id: int) -> tuple[DashboardStats, list[OutageIncident]]:
             .order_by(ServiceStatusLog.service_id)
         ).all()
 
-        # A scanned file shows exactly what was stored; one not scanned yet is
-        # detected on the fly, without writing anything.
-        outage = session.get(TestOutage, file_id)
-        if outage is not None:
-            incidents = _stored_incidents(session, outage)
-        else:
-            down_checks = [
-                (row.service_id, row.checked_at)
-                for row in session.execute(LOAD_DOWN_CHECKS.where(ServiceStatusLog.file_id == file_id))
-            ]
-            incidents = detect_incidents(down_checks, start_date)
+    return first, last, tuple(tuple(row) for row in per_service)
+
+
+def _file_stats(file_id: int) -> DashboardStats:
+    """The headline figures for one file. Incidents come only from the stored
+    scan; a file with none stored shows none, rather than being scanned here."""
+    with Session(engine) as session:
+        uploaded = _stored_file(session, file_id)
+        scanned = session.get(TestOutage, file_id) is not None
+
+        # Count and longest incident per service, from the small incident
+        # table rather than from the checks.
+        incident_totals = {
+            service_id: (count, longest * SLOT_MINUTES)
+            for service_id, count, longest in session.execute(
+                select(TestOutageIncident.service_id, func.count(), func.max(INCIDENT_LENGTH))
+                .where(TestOutageIncident.file_id == file_id)
+                .group_by(TestOutageIncident.service_id)
+            )
+        }
+
+    first, last, per_service = _check_totals(file_id)
+    days = (last.date() - first.date()).days + 1
 
     services: list[ServiceStats] = []
     for service_id, service_name, up, down, invalid, avg_latency, p95_latency in per_service:
-        own = [incident for incident in incidents if incident.service_id == service_id]
+        incident_count, longest = incident_totals.get(service_id, (0, 0))
         availability = _pct(up, up + down)
         services.append(
             ServiceStats(
@@ -1107,8 +1155,8 @@ def _file_stats(file_id: int) -> tuple[DashboardStats, list[OutageIncident]]:
                 downtime_minutes=down * SLOT_MINUTES,
                 # The downtime the SLA tolerates over the minutes actually observed.
                 allowed_downtime_minutes=round((up + down) * SLOT_MINUTES * (100 - SLA_TARGET_PCT) / 100, 2),
-                incidents=len(own),
-                longest_incident_minutes=max((incident.downtime_minutes for incident in own), default=0),
+                incidents=incident_count,
+                longest_incident_minutes=longest,
                 avg_latency_ms=None if avg_latency is None else round(float(avg_latency), 1),
                 p95_latency_ms=None if p95_latency is None else round(float(p95_latency), 1),
             )
@@ -1116,10 +1164,10 @@ def _file_stats(file_id: int) -> tuple[DashboardStats, list[OutageIncident]]:
 
     total_up = sum(service.up_checks for service in services)
     total_down = sum(service.down_checks for service in services)
-    summary = DashboardStats(
+    return DashboardStats(
         file_id=file_id,
         file_name=uploaded.file_name,
-        scanned=outage is not None,
+        scanned=scanned,
         sla_target_pct=SLA_TARGET_PCT,
         coverage_start=first,
         coverage_end=last,
@@ -1127,15 +1175,14 @@ def _file_stats(file_id: int) -> tuple[DashboardStats, list[OutageIncident]]:
         availability_pct=_pct(total_up, total_up + total_down),
         services_breaching=sum(service.meets_sla is False for service in services),
         total_downtime_minutes=total_down * SLOT_MINUTES,
-        incident_count=len(incidents),
-        longest_incident_minutes=max((incident.downtime_minutes for incident in incidents), default=0),
+        incident_count=sum(count for count, _ in incident_totals.values()),
+        longest_incident_minutes=max((longest for _, longest in incident_totals.values()), default=0),
         services=services,
     )
-    return summary, incidents
 
 
 def dashboard_stats(file_id: int) -> DashboardStats:
-    return _file_stats(file_id)[0]
+    return _file_stats(file_id)
 
 
 def _sorted_page(items: list, value, tiebreak, order: str, page: int, page_size: int) -> tuple[int, list]:
@@ -1163,19 +1210,20 @@ SERVICE_SORT_VALUES = {
     "gaps": lambda service: service.invalid_checks + service.missing_checks,
 }
 
-INCIDENT_SORT_VALUES = {
-    "service": lambda incident: incident.service_id,
-    "started": lambda incident: incident.started_at,
-    "ended": lambda incident: incident.ended_at,
-    "checks": lambda incident: incident.down_checks,
-    "downtime": lambda incident: incident.downtime_minutes,
+# Day then check-point is start time; the range's length is both the failed
+# checks and the downtime.
+INCIDENT_SORT_COLUMNS = {
+    "service": (TestOutageIncident.service_id,),
+    "started": (TestOutageIncident.day_index, TestOutageIncident.checkpoint_start),
+    "ended": (TestOutageIncident.day_index, TestOutageIncident.checkpoint_end),
+    "checks": (INCIDENT_LENGTH,),
+    "downtime": (INCIDENT_LENGTH,),
 }
 
 
 def service_page(file_id: int, sort: ServiceSort, order: str, page: int, page_size: int) -> ServicePage:
-    # Service figures are worked out per request rather than stored, so the
-    # whole list is built and one page of it returned.
-    summary, _ = _file_stats(file_id)
+    # One row per service, so the handful of them is sorted here.
+    summary = _file_stats(file_id)
     total, items = _sorted_page(
         summary.services, SERVICE_SORT_VALUES[sort], lambda service: service.service_id, order, page, page_size
     )
@@ -1183,15 +1231,32 @@ def service_page(file_id: int, sort: ServiceSort, order: str, page: int, page_si
 
 
 def incident_page(file_id: int, sort: IncidentSort, order: str, page: int, page_size: int) -> IncidentPage:
-    _, incidents = _file_stats(file_id)
-    total, items = _sorted_page(
-        incidents,
-        INCIDENT_SORT_VALUES[sort],
-        lambda incident: (incident.started_at, incident.service_id),
-        order,
-        page,
-        page_size,
-    )
+    """One page of the stored incidents, sorted and paged by the database."""
+    condition = TestOutageIncident.file_id == file_id
+    with Session(engine) as session:
+        _stored_file(session, file_id)
+        outage = session.get(TestOutage, file_id)
+        if outage is None:
+            return IncidentPage(total=0, page=page, page_size=page_size, items=[])
+
+        total = session.execute(select(func.count()).select_from(TestOutageIncident).where(condition)).scalar_one()
+        columns = INCIDENT_SORT_COLUMNS[sort]
+        rows = session.execute(
+            select(TestOutageIncident)
+            .where(condition)
+            # Start time then service break ties, so a row never shows up on
+            # two pages.
+            .order_by(
+                *(column.desc() if order == "desc" else column.asc() for column in columns),
+                TestOutageIncident.day_index,
+                TestOutageIncident.checkpoint_start,
+                TestOutageIncident.service_id,
+            )
+            .offset((page - 1) * page_size)
+            .limit(page_size)
+        ).scalars()
+        items = [_as_incident(row, outage.start_date) for row in rows]
+
     return IncidentPage(total=total, page=page, page_size=page_size, items=items)
 
 
@@ -1315,10 +1380,12 @@ async def create_upload(file: UploadFile = File(...)) -> UploadReport:
 
     warnings: list[str] = []
     try:
-        file_id = save_upload(file_name, result, warnings)
+        file_id = save_upload(file_name, content, result, warnings)
     except (SQLAlchemyError, psycopg.Error) as exc:
         # COPY reports failures as psycopg errors, not SQLAlchemy ones.
         raise HTTPException(status_code=503, detail="The file was read but could not be saved.") from exc
+    except (BotoCoreError, ClientError, RuntimeError) as exc:
+        raise HTTPException(status_code=503, detail="The file was read but could not be stored in S3.") from exc
 
     return build_report(file_id, file_name, result, ragged, warnings)
 

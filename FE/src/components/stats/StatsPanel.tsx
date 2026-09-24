@@ -85,8 +85,7 @@ export function StatsPanel({ stats, isLoading, error, onSelectService, onSelectI
               <KpiTiles stats={stats} />
               {!stats.scanned && (
                 <p className="text-xs text-amber-700">
-                  This file has not been scanned for outages yet; incidents below are detected on the fly and not
-                  stored.
+                  This file has not been scanned for outages yet, so no incidents are shown for it.
                 </p>
               )}
               <div>
