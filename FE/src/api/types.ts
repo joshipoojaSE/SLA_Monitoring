@@ -101,31 +101,21 @@ export interface LogFilters {
   pageSize: number
 }
 
-export interface UploadReport {
+/** POST /uploads: the file is in S3 and the Lambda is working on it. */
+export interface UploadAccepted {
   file_id: number
   file_name: string
-  status: 'clean' | 'accepted_with_warnings'
+  status: 'processing'
+}
+
+/** GET /uploads/{id}: 'processing' until the Lambda finishes. */
+export interface UploadStatus {
+  file_id: number
+  file_name: string
+  uploaded_at: string
+  status: 'processing' | 'done' | 'failed'
+  error_message: string | null
   rows_received: number
-  clean_checks: number
-  rows_removed: number
-  coverage: {
-    start: string
-    end: string
-    days: number
-    services: string[]
-    expected_checks: number
-    missing_checks: number
-  }
-  duplicates: {
-    total: number
-    exact_rows: number
-    same_slot_rows: number
-    conflicting_slots: number
-  }
-  issues: Record<string, number>
-  ragged_rows: number
-  rejected_rows: { line: number; reason: string }[]
-  warnings: string[]
 }
 
 export interface OutageReport {

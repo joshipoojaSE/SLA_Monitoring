@@ -1,37 +1,23 @@
 import { useState, type DragEvent, type FormEvent } from 'react'
 import { Link } from 'react-router-dom'
-import type { OutageReport, UploadReport } from '../api/types'
+import type { OutageReport, UploadStatus } from '../api/types'
 import { Badge, Card, Spinner, StateMessage } from '../components/ui'
 import { useUpload } from '../hooks/queries'
 import { formatDateTime, formatMinutes, formatNumber } from '../lib/format'
 
-const ISSUE_LABELS: Record<string, string> = {
-  epoch_timestamps: 'Epoch timestamps converted',
-  offset_timestamps: 'Timestamps with an offset, moved to UTC',
-  naive_timestamps: 'Timestamps without a zone, read as UTC',
-  latency_converted_from_seconds: 'Latencies converted from seconds',
-  blank_latency: 'Blank latencies',
-  negative_latency: 'Negative latencies dropped',
-  invalid_status_codes: 'Invalid status codes',
-}
-
-function Report({ report, outages }: { report: UploadReport; outages: OutageReport }) {
-  const issues = Object.entries(report.issues).filter(([, count]) => count > 0)
+function Report({ upload, outages }: { upload: UploadStatus; outages: OutageReport }) {
   const facts: [string, string][] = [
-    ['Rows received', formatNumber(report.rows_received)],
-    ['Clean checks saved', formatNumber(report.clean_checks)],
-    ['Rows removed', formatNumber(report.rows_removed)],
-    ['Duplicates', formatNumber(report.duplicates.total)],
-    ['Covers', `${formatDateTime(report.coverage.start)} – ${formatDateTime(report.coverage.end)} (${report.coverage.days} days)`],
-    ['Missing checks', `${formatNumber(report.coverage.missing_checks)} of ${formatNumber(report.coverage.expected_checks)}`],
+    ['Rows received', formatNumber(upload.rows_received)],
+    ['Uploaded', formatDateTime(upload.uploaded_at)],
     ['Incidents found', `${outages.incidents_found} (${formatMinutes(outages.total_downtime_minutes)} downtime)`],
+    ['Services affected', outages.services_affected.join(', ') || 'None'],
   ]
 
   return (
     <Card className="space-y-4 p-4">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <h2 className="font-semibold">{report.file_name}</h2>
-        {report.status === 'clean' ? <Badge tone="good">Clean</Badge> : <Badge tone="warn">Accepted with warnings</Badge>}
+        <h2 className="font-semibold">{upload.file_name}</h2>
+        <Badge tone="good">Saved</Badge>
       </div>
 
       <dl className="grid gap-x-6 gap-y-2 text-sm sm:grid-cols-2">
@@ -43,32 +29,8 @@ function Report({ report, outages }: { report: UploadReport; outages: OutageRepo
         ))}
       </dl>
 
-      {issues.length > 0 && (
-        <div>
-          <h3 className="mb-1 text-sm font-semibold">Cleaned</h3>
-          <ul className="list-inside list-disc text-sm text-slate-700">
-            {issues.map(([key, count]) => (
-              <li key={key}>
-                {ISSUE_LABELS[key] ?? key}: {formatNumber(count)}
-              </li>
-            ))}
-          </ul>
-        </div>
-      )}
-
-      {report.warnings.length > 0 && (
-        <div>
-          <h3 className="mb-1 text-sm font-semibold">Warnings</h3>
-          <ul className="list-inside list-disc text-sm text-amber-800">
-            {report.warnings.map((warning) => (
-              <li key={warning}>{warning}</li>
-            ))}
-          </ul>
-        </div>
-      )}
-
       <Link
-        to={`/?file=${report.file_id}`}
+        to={`/?file=${upload.file_id}`}
         className="inline-block rounded-md bg-slate-800 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700"
       >
         Open in dashboard
@@ -101,7 +63,7 @@ export function UploadPage() {
           <div>
             <h1 className="font-semibold">Upload health checks</h1>
             <p className="text-sm text-slate-500">
-              A CSV of monitoring checks. It is validated and cleaned, saved, then scanned for outages.
+              A CSV of monitoring checks. It is checked and stored, then cleaned, saved and scanned for outages in the background.
             </p>
           </div>
 
@@ -138,7 +100,7 @@ export function UploadPage() {
       </form>
 
       {upload.error && <StateMessage tone="error">{upload.error.message}</StateMessage>}
-      {upload.data && <Report report={upload.data.report} outages={upload.data.outages} />}
+      {upload.data && <Report upload={upload.data.upload} outages={upload.data.outages} />}
     </div>
   )
 }

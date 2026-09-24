@@ -42,6 +42,15 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 
+# AWS Lambda packaging (see AWS/README.md)
+AWS/build/
+AWS/function.zip
+# env.json holds DATABASE_URL, the database password included.
+AWS/env.json
+AWS/trust-policy.json
+AWS/s3-read-policy.json
+AWS/notification.json
+
 # Local databases
 *.db
 *.sqlite

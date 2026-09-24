@@ -1,6 +1,6 @@
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from '../api/client'
-import type { IncidentSort, LogFilters, ServiceSort, TableQuery } from '../api/types'
+import type { IncidentSort, LogFilters, ServiceSort, TableQuery, UploadStatus } from '../api/types'
 
 export const useFiles = () => useQuery({ queryKey: ['files'], queryFn: api.files })
 
@@ -35,18 +35,36 @@ export const useIncidentPage = (fileId: number, query: TableQuery<IncidentSort>)
     placeholderData: keepPreviousData,
   })
 
-/** Upload, then scan for outages, so the dashboard opens on a complete file. */
+const POLL_INTERVAL_MS = 2000
+// The Lambda's own timeout is 300 s; past that it will not finish.
+const POLL_TIMEOUT_MS = 330_000
+
+/** Wait for the Lambda to finish with an upload, which it does after the API returns. */
+async function waitForUpload(fileId: number): Promise<UploadStatus> {
+  const deadline = Date.now() + POLL_TIMEOUT_MS
+  for (;;) {
+    const status = await api.uploadStatus(fileId)
+    if (status.status === 'done') return status
+    if (status.status === 'failed') throw new Error(status.error_message ?? `File ${fileId} could not be processed.`)
+    if (Date.now() > deadline) throw new Error(`File ${fileId} is still processing. Check the Lambda's logs.`)
+    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS))
+  }
+}
+
+/** Upload, wait for the Lambda to save it, then read back its outage scan. */
 export const useUpload = () => {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: async (file: File) => {
-      const report = await api.upload(file)
-      const outages = await api.scanOutages(report.file_id)
-      return { report, outages }
+      const accepted = await api.upload(file)
+      const upload = await waitForUpload(accepted.file_id)
+      // The Lambda has already scanned the file, so this only reads the result.
+      const outages = await api.scanOutages(upload.file_id)
+      return { upload, outages }
     },
-    onSuccess: ({ report }) => {
+    onSuccess: ({ upload }) => {
       queryClient.invalidateQueries({ queryKey: ['files'] })
-      queryClient.invalidateQueries({ queryKey: ['stats', report.file_id] })
+      queryClient.invalidateQueries({ queryKey: ['stats', upload.file_id] })
     },
   })
 }

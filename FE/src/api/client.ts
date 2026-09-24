@@ -10,7 +10,8 @@ import type {
   ServiceSort,
   ServiceStats,
   TableQuery,
-  UploadReport,
+  UploadAccepted,
+  UploadStatus,
 } from './types'
 
 const API_URL = (import.meta.env.VITE_API_URL ?? 'http://localhost:8001').replace(/\/$/, '')
@@ -86,8 +87,10 @@ export const api = {
   upload: (file: File) => {
     const form = new FormData()
     form.append('file', file)
-    return request<UploadReport>('/uploads', { method: 'POST', body: form })
+    return request<UploadAccepted>('/uploads', { method: 'POST', body: form })
   },
+
+  uploadStatus: (fileId: number) => request<UploadStatus>(`/uploads/${fileId}`),
 
   scanOutages: (fileId: number) => request<OutageReport>(`/outage?file_id=${fileId}`, { method: 'POST' }),
 }
