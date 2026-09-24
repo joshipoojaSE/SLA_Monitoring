@@ -16,6 +16,7 @@ erDiagram
     services ||--o{ service_status_logs : "monitored"
     agents ||--o{ service_status_logs : "reported by"
     regions ||--o{ agents : "hosts"
+    uploaded_files ||--o| test_outages : "scanned as"
     test_outages ||--o{ test_outage_incidents : "lists"
     services ||--o{ test_outage_incidents : "affected"
 ```
@@ -27,19 +28,19 @@ erDiagram
 | Master | `agents` | Monitoring agents and their region | 2 |
 | Transaction | `uploaded_files` | One row per uploaded file | 1 per file |
 | Transaction | `service_status_logs` | One clean check per service per slot | 14,400 for the 30-day file |
-| Reference | `test_outages` | Expected days and start date per sample file, from `dataset_incident_log.json` | 5 in total |
-| Reference | `test_outage_incidents` | Seeded outages per sample file, from `dataset_incident_log.json` | 8 in total |
+| Outage scan | `test_outages` | One outage scan per uploaded file: its days and start date | 1 per scanned file |
+| Outage scan | `test_outage_incidents` | The incidents that scan found | A few per file |
 
 All 5 sample files together come to about 41,000 clean checks, well inside any free tier.
 
-**7 tables in total:** 3 master, 2 transaction and 2 reference tables. Each table must be created after the tables it links to:
+**7 tables in total:** 3 master, 2 transaction and 2 outage scan tables. Each table must be created after the tables it links to:
 
 1. `regions`
 2. `services`
 3. `agents` (needs `regions`)
 4. `uploaded_files`
 5. `service_status_logs` (needs `uploaded_files`, `services`, `agents`)
-6. `test_outages`
+6. `test_outages` (needs `uploaded_files`)
 7. `test_outage_incidents` (needs `test_outages`, `services`)
 
 ---
@@ -156,37 +157,34 @@ Design notes:
 
 ---
 
-## 6. Reference tables (verification only)
+## 6. Outage scan tables
 
-These tables hold the contents of `dataset_incident_log.json`: what each sample file is **supposed** to contain. They are used **only** to check the pipeline's results, never to calculate anything shown as real data. Availability, incidents and the date range always come from `service_status_logs`.
+`POST /outage?file_id=…` finds the incidents in one uploaded file's `service_status_logs` and stores them here. The input is only the stored checks, never `dataset_incident_log.json`.
 
-### `test_outages`: one row per sample file
+Both tables are keyed by `file_id`, not file name. File names repeat (the same CSV uploaded twice, or a corrected file under the same name), and each upload is its own dataset with its own scan. Deleting an upload deletes its scan with it.
+
+### `test_outages`: one row per scanned file
 
 | Column | Type | Rules | Example |
 |---|---|---|---|
-| file_name | text | Primary key | monitoring_checks_9d_seed101.csv |
+| file_id | number | Primary key, links to `uploaded_files` | 2 |
 | days | integer | Required, more than 0 | 9 |
 | start_date | date | Required | 2025-05-08 |
 
-### `test_outage_incidents`: one row per seeded outage
+### `test_outage_incidents`: one row per incident, per day
 
 | Column | Type | Rules | Example |
 |---|---|---|---|
 | incident_id | auto number | Primary key | 1 |
-| file_name | text | Required, links to `test_outages` | monitoring_checks_9d_seed101.csv |
+| file_id | number | Required, links to `test_outages` | 2 |
 | service_id | text | Required, links to `services` | svc-reports |
 | day_index | integer | Required, 0 = first day of the file | 5 |
 | checkpoint_start | integer | Required, 0–95 | 64 |
 | checkpoint_end | integer | Required, 0–95, ≥ checkpoint_start | 69 |
 
-**Unique together:** `file_name` + `service_id` + `day_index` + `checkpoint_start`.
+**Unique together:** `file_id` + `service_id` + `day_index` + `checkpoint_start`.
 
-**How the JSON maps to these columns:**
-
-```
-"svc-reports day 5": "check-points 64-69 (~16:00-17:15 UTC)"
- └ service_id  └ day_index        └ start └ end    └ not stored (can be calculated)
-```
+An incident that runs past midnight is stored as one row per day, because a row covers check-points within a single day.
 
 **Calculated, not stored** (normalization: these follow from the stored columns):
 
@@ -197,9 +195,7 @@ These tables hold the contents of `dataset_incident_log.json`: what each sample 
 | Last failing check | `checkpoint_end` × 15 minutes | 69 × 15 = 17:15 UTC |
 | Expected clean checks | `days` × 96 × 5 services | 9 × 96 × 5 = 4,320 |
 
-**How the data gets in:** loaded once, as starting data (section 7). It is not uploaded through the upload page, because it isn't monitoring data.
-
-**How it links to an uploaded file:** by file name. When the selected uploaded file's `file_name` matches a `test_outages` row, the dashboard can show a verification panel. There is no database link to `uploaded_files`, because the reference exists before any upload, and the same file can be uploaded more than once. A renamed file, or a file the reviewer has never shared before, simply shows "no reference available".
+**How the data gets in:** written by the outage scan, once per file. Scanning a file again reads the stored rows back instead of writing them twice.
 
 ---
 
@@ -223,29 +219,6 @@ These tables hold the contents of `dataset_incident_log.json`: what each sample 
 | agent-2 | ap-south-1 |
 
 These services and agents are the ones found in the sample files. New ones in a future file are added automatically; the same `service_id` arriving with a different name is flagged as a conflict.
-
-**test_outages** (from `dataset_incident_log.json`)
-
-| file_name | days | start_date |
-|---|---|---|
-| monitoring_checks_9d_seed101.csv | 9 | 2025-05-08 |
-| monitoring_checks_12d_seed505.csv | 12 | 2025-04-10 |
-| monitoring_checks_14d_seed202.csv | 14 | 2025-05-19 |
-| monitoring_checks_21d_seed303.csv | 21 | 2025-04-03 |
-| monitoring_checks_30d_seed404.csv | 30 | 2025-04-06 |
-
-**test_outage_incidents** (from `dataset_incident_log.json`)
-
-| id | file_name | service_id | day_index | checkpoint_start | checkpoint_end |
-|---|---|---|---|---|---|
-| 1 | monitoring_checks_9d_seed101.csv | svc-reports | 5 | 64 | 69 |
-| 2 | monitoring_checks_12d_seed505.csv | svc-search | 4 | 48 | 67 |
-| 3 | monitoring_checks_12d_seed505.csv | svc-search | 8 | 49 | 54 |
-| 4 | monitoring_checks_14d_seed202.csv | svc-notify | 0 | 59 | 77 |
-| 5 | monitoring_checks_14d_seed202.csv | svc-notify | 6 | 30 | 40 |
-| 6 | monitoring_checks_21d_seed303.csv | svc-payments | 2 | 38 | 60 |
-| 7 | monitoring_checks_30d_seed404.csv | svc-auth | 16 | 16 | 41 |
-| 8 | monitoring_checks_30d_seed404.csv | svc-reports | 3 | 47 | 55 |
 
 ---
 
@@ -304,7 +277,6 @@ Both lines describe the same check: search-api at 12:15 UTC on 14 April. One tim
 | Latency p50 / p95 / max | `service_status_logs.latency_ms` | Ignoring empty values |
 | Data quality section | `uploaded_files` + `service_status_logs` | Rows received, clean checks (count of `service_status_logs`), and lines removed (received − clean) |
 | Missing checks | `service_status_logs` | Every expected 15-minute slot with no check |
-| Verification panel (optional) | `test_outages` + `test_outage_incidents`, compared with `service_status_logs` | For a matching file name: expected vs detected date range and check count, and whether each seeded outage overlaps a detected incident on the same service and date (✓ / ✗) |
 | Logs view | `service_status_logs` + `services` | Filter by `checked_at` from start date 00:00 to the day after the end date 00:00 UTC, optionally by service; paged |
 
 ---
@@ -320,6 +292,6 @@ Both lines describe the same check: search-api at 12:15 UTC on 14 April. One tim
 | Date range on `uploaded_files` | Calculated from `service_status_logs` |
 | `latency_unit` on clean checks | Everything is in ms |
 | `service_name` and `region` on each check | Stored once in `services` and `agents` |
-| Reference data mixed into real results | `dataset_incident_log.json` is stored in its own reference tables and used only for verification. No stat, incident or date range on the dashboard is taken from it |
+| `dataset_incident_log.json` | Not loaded. Every incident comes from the stored checks |
 
 **Trade-off:** calculating on every request is slower than reading saved numbers, but with at most ~15,000 checks per file it stays well under a second. With millions of rows, the SLA summary would be pre-calculated after each upload instead.

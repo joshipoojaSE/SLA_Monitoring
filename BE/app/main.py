@@ -881,11 +881,12 @@ def detect_incidents(down_checks: list[tuple[str, datetime]], start_date: date) 
     return incidents
 
 
-def _stored_incidents(session: Session, file_id: int, outage: TestOutage) -> list[OutageIncident]:
+def _stored_incidents(session: Session, outage: TestOutage) -> list[OutageIncident]:
     """Read back a scan done earlier."""
+    file_id = outage.file_id
     rows = session.execute(
         select(TestOutageIncident)
-        .where(TestOutageIncident.file_name == outage.file_name)
+        .where(TestOutageIncident.file_id == file_id)
         .order_by(TestOutageIncident.day_index, TestOutageIncident.checkpoint_start)
     ).scalars()
 
@@ -957,13 +958,13 @@ def scan_outages(file_id: int) -> OutageReport:
             )
         file_name = uploaded.file_name
 
-        # The outage tables are keyed by file name, so a file already scanned
-        # is read back rather than written a second time. That also covers the
-        # same file uploaded twice under two different file ids.
-        stored = session.get(TestOutage, file_name)
+        # A file already scanned is read back rather than written a second
+        # time. Keyed by file_id, not name: two uploads that share a name are
+        # separate datasets and each gets its own scan.
+        stored = session.get(TestOutage, file_id)
         if stored is not None:
             return _outage_report(
-                file_id, file_name, True, stored.start_date, stored.days, _stored_incidents(session, file_id, stored)
+                file_id, file_name, True, stored.start_date, stored.days, _stored_incidents(session, stored)
             )
 
         first, last = session.execute(LOAD_COVERAGE.where(ServiceStatusLog.file_id == file_id)).one()
@@ -978,11 +979,11 @@ def scan_outages(file_id: int) -> OutageReport:
         ]
         incidents = detect_incidents(down_checks, start_date)
 
-        # The parent row first: test_outage_incidents points at it by name.
-        session.add(TestOutage(file_name=file_name, days=days, start_date=start_date))
+        # The parent row first: test_outage_incidents points at it.
+        session.add(TestOutage(file_id=file_id, days=days, start_date=start_date))
         session.add_all(
             TestOutageIncident(
-                file_name=file_name,
+                file_id=file_id,
                 service_id=incident.service_id,
                 day_index=incident.day_index,
                 checkpoint_start=incident.checkpoint_start,
@@ -1028,10 +1029,10 @@ def list_files() -> list[FileSummary]:
         select(
             UploadedFile,
             func.coalesce(checks.c.stored_checks, 0),
-            TestOutage.file_name.is_not(None),
+            TestOutage.file_id.is_not(None),
         )
         .outerjoin(checks, checks.c.file_id == UploadedFile.file_id)
-        .outerjoin(TestOutage, TestOutage.file_name == UploadedFile.file_name)
+        .outerjoin(TestOutage, TestOutage.file_id == UploadedFile.file_id)
         .where(UploadedFile.status == "done")
         .order_by(UploadedFile.uploaded_at.desc())
     )
@@ -1079,9 +1080,9 @@ def _file_stats(file_id: int) -> tuple[DashboardStats, list[OutageIncident]]:
 
         # A scanned file shows exactly what was stored; one not scanned yet is
         # detected on the fly, without writing anything.
-        outage = session.get(TestOutage, uploaded.file_name)
+        outage = session.get(TestOutage, file_id)
         if outage is not None:
-            incidents = _stored_incidents(session, file_id, outage)
+            incidents = _stored_incidents(session, outage)
         else:
             down_checks = [
                 (row.service_id, row.checked_at)

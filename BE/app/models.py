@@ -93,7 +93,10 @@ class TestOutage(Base):
     __tablename__ = "test_outages"
     __table_args__ = (CheckConstraint("days > 0", name="ck_test_outages_days"),)
 
-    file_name: Mapped[str] = mapped_column(Text, primary_key=True)
+    # One scan per upload: keyed by file_id, since file names repeat.
+    file_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("uploaded_files.file_id", ondelete="CASCADE"), primary_key=True
+    )
     days: Mapped[int] = mapped_column(Integer)
     start_date: Mapped[date] = mapped_column(Date)
 
@@ -102,7 +105,7 @@ class TestOutageIncident(Base):
     __tablename__ = "test_outage_incidents"
     __table_args__ = (
         UniqueConstraint(
-            "file_name", "service_id", "day_index", "checkpoint_start", name="uq_test_outage_incidents_outage"
+            "file_id", "service_id", "day_index", "checkpoint_start", name="uq_test_outage_incidents_outage"
         ),
         CheckConstraint("day_index >= 0", name="ck_test_outage_incidents_day_index"),
         CheckConstraint("checkpoint_start BETWEEN 0 AND 95", name="ck_test_outage_incidents_start"),
@@ -111,7 +114,7 @@ class TestOutageIncident(Base):
     )
 
     incident_id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
-    file_name: Mapped[str] = mapped_column(ForeignKey("test_outages.file_name"))
+    file_id: Mapped[int] = mapped_column(ForeignKey("test_outages.file_id", ondelete="CASCADE"))
     service_id: Mapped[str] = mapped_column(ForeignKey("services.service_id"))
     day_index: Mapped[int] = mapped_column(Integer)
     checkpoint_start: Mapped[int] = mapped_column(Integer)

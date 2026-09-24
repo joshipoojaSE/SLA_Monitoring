@@ -66,7 +66,12 @@ def upgrade() -> None:
     op.create_index("ix_service_status_logs_file_checked_at", "service_status_logs", ["file_id", "checked_at"])
     op.create_table(
         "test_outages",
-        sa.Column("file_name", sa.Text(), primary_key=True),
+        sa.Column(
+            "file_id",
+            sa.BigInteger(),
+            sa.ForeignKey("uploaded_files.file_id", ondelete="CASCADE"),
+            primary_key=True,
+        ),
         sa.Column("days", sa.Integer(), nullable=False),
         sa.Column("start_date", sa.Date(), nullable=False),
         sa.CheckConstraint("days > 0", name="ck_test_outages_days"),
@@ -74,13 +79,18 @@ def upgrade() -> None:
     op.create_table(
         "test_outage_incidents",
         sa.Column("incident_id", sa.BigInteger(), sa.Identity(always=True), primary_key=True),
-        sa.Column("file_name", sa.Text(), sa.ForeignKey("test_outages.file_name"), nullable=False),
+        sa.Column(
+            "file_id",
+            sa.BigInteger(),
+            sa.ForeignKey("test_outages.file_id", ondelete="CASCADE"),
+            nullable=False,
+        ),
         sa.Column("service_id", sa.Text(), sa.ForeignKey("services.service_id"), nullable=False),
         sa.Column("day_index", sa.Integer(), nullable=False),
         sa.Column("checkpoint_start", sa.Integer(), nullable=False),
         sa.Column("checkpoint_end", sa.Integer(), nullable=False),
         sa.UniqueConstraint(
-            "file_name", "service_id", "day_index", "checkpoint_start", name="uq_test_outage_incidents_outage"
+            "file_id", "service_id", "day_index", "checkpoint_start", name="uq_test_outage_incidents_outage"
         ),
         sa.CheckConstraint("day_index >= 0", name="ck_test_outage_incidents_day_index"),
         sa.CheckConstraint("checkpoint_start BETWEEN 0 AND 95", name="ck_test_outage_incidents_start"),

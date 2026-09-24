@@ -20,7 +20,15 @@ export const formatDate = (iso: string) => dateOnly.format(new Date(iso))
 /** The YYYY-MM-DD UTC day an ISO timestamp falls on. */
 export const utcDay = (iso: string) => iso.slice(0, 10)
 
-export const formatPct = (value: number | null, digits = 3) => (value === null ? '—' : `${value.toFixed(digits)}%`)
+/**
+ * Rounded down, never up: 99.8997% must not read as "99.900%" beside a
+ * Breached badge. The 1e-9 absorbs float error (1.001 * 1000 is 1000.999…).
+ */
+export function formatPct(value: number | null, digits = 3): string {
+  if (value === null) return '—'
+  const scale = 10 ** digits
+  return `${(Math.floor(value * scale + 1e-9) / scale).toFixed(digits)}%`
+}
 
 export const formatNumber = (value: number) => value.toLocaleString('en-US')
 
