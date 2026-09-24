@@ -20,6 +20,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from mangum import Mangum
 from pydantic import BaseModel
 from sqlalchemy import func, select, text
 from sqlalchemy.exc import SQLAlchemyError
@@ -43,9 +44,10 @@ logger = logging.getLogger(__name__)
 
 ALLOWED_EXTENSIONS = (".csv",)
 
-# The 30-day sample file is 1.1 MB. The cap is generous for this data and
-# still under the few-MB request body limit serverless platforms impose.
-MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+# The 30-day sample file is 1.1 MB. On AWS Lambda a request can be at most
+# 6 MB, and the Function URL sends an uploaded file base64-encoded (a third
+# bigger), so 4 MB is the largest file that always fits.
+MAX_UPLOAD_BYTES = 4 * 1024 * 1024
 
 REQUIRED_COLUMNS = (
     "service_id",
@@ -78,8 +80,9 @@ CORS_ORIGINS = [
     origin.strip() for origin in os.getenv("CORS_ORIGINS", "http://localhost:5174").split(",") if origin.strip()
 ]
 
-# Every raw upload is kept at s3://S3_BUCKET/<file_id>/<file name>. Credentials
-# come from the usual AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY variables.
+# Every raw upload is kept at s3://S3_BUCKET/<file_id>/<file name>. Locally,
+# credentials come from the usual AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+# variables; on Lambda, from the function's role.
 S3_BUCKET = os.getenv("S3_BUCKET", "")
 AWS_REGION = os.getenv("AWS_REGION") or None
 
@@ -795,3 +798,8 @@ def get_logs(
 ) -> LogPage:
     """The stored checks behind the stats, filtered, sorted and paged."""
     return read_logs(file_id, date_from, date_to, service_id, outcome, page, page_size, sort, order)
+
+
+# The AWS Lambda entry point (handler "app.main.handler"): turns a Function URL
+# request into an ASGI call to the same app uvicorn runs locally.
+handler = Mangum(app, lifespan="off")

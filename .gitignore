@@ -42,14 +42,14 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 
-# AWS Lambda packaging (see AWS/README.md)
-AWS/build/
-AWS/function.zip
+# AWS Lambda packaging (see AWS/README.md and BE/README.md), in any folder:
+# a deploy run from the wrong folder leaves them there too. build/ is above.
+*.zip
 # env.json holds DATABASE_URL, the database password included.
-AWS/env.json
-AWS/trust-policy.json
-AWS/s3-read-policy.json
-AWS/notification.json
+env.json
+trust-policy.json
+s3-*-policy.json
+notification.json
 
 # Local databases
 *.db

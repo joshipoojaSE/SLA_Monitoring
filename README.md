@@ -21,7 +21,8 @@ flowchart LR
 | Part | Runs on | Why |
 |---|---|---|
 | Upload page | TBD | |
-| Serverless function | TBD | Must be a real deployed cloud function (assignment requirement). It is stateless: it keeps nothing between calls, and everything needed later is written to the database |
+| API (FastAPI) | **AWS Lambda + Function URL** (via Mangum) | Free at this volume and never sleeps (a cold start is about 1–2 s, where free web hosts take 30–60 s to wake). Same account and region as the bucket. Checks the file and stores it in S3; reads stats and logs from the database. Limit: a Lambda request is at most 6 MB, so uploads are capped at 4 MB. Deploy steps: [BE/README.md](BE/README.md#deploy-to-aws-lambda) |
+| Serverless function | **AWS Lambda, triggered by S3** | Must be a real deployed cloud function (assignment requirement). It is stateless: it keeps nothing between calls, and everything needed later is written to the database. Parses, validates and cleans the CSV, then saves the checks and incidents. Deploy steps: [AWS/README.md](AWS/README.md) |
 | Database | **Neon** (PostgreSQL, free tier) | Relational data with clear links between files, services and checks; SQL handles date-range filters and per-month aggregates well; free tier needs no credit card; provides a pooled connection suited to serverless functions |
 | Dashboard page | TBD | |
 
@@ -170,7 +171,12 @@ TBD
 
 ### Redeploy
 
-TBD
+| Part | How |
+|---|---|
+| API | [BE/README.md → Deploy to AWS Lambda](BE/README.md#deploy-to-aws-lambda). After a code change: rebuild the zip and run `aws lambda update-function-code` |
+| Upload processor | [AWS/README.md](AWS/README.md). After a code change: rebuild the zip and run `aws lambda update-function-code` |
+| Database tables | `alembic upgrade head` from `BE/` ([BE/README.md](BE/README.md#database)) |
+| Dashboard | TBD |
 
 ### Verify with the sample files
 

@@ -8,7 +8,7 @@ and hands the file over through S3.
 
 ```
 Browser ──POST /uploads──▶ API (BE/app/main.py)
-                             1. file present, .csv, ≤ 10 MB, not empty, UTF-8
+                             1. file present, .csv, ≤ 4 MB, not empty, UTF-8
                              2. header has every required column, ≥ 1 data line
                                 └─ fails → 422, nothing stored
                              3. INSERT uploaded_files (status = 'processing') → file_id
