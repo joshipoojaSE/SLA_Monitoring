@@ -5,7 +5,6 @@ import type {
   LogFilters,
   LogPage,
   OutageIncident,
-  OutageReport,
   Page,
   ServiceSort,
   ServiceStats,
@@ -91,6 +90,4 @@ export const api = {
   },
 
   uploadStatus: (fileId: number) => request<UploadStatus>(`/uploads/${fileId}`),
-
-  scanOutages: (fileId: number) => request<OutageReport>(`/outage?file_id=${fileId}`, { method: 'POST' }),
 }

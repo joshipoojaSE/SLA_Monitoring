@@ -36,12 +36,12 @@ flowchart LR
 | `agents` | Master | Monitoring agents and their region |
 | `uploaded_files` | Transaction | One row per uploaded file |
 | `service_status_logs` | Transaction | One clean check per service per 15-minute slot |
-| `test_outages` | Reference | Expected days and start date per sample file |
-| `test_outage_incidents` | Reference | Seeded outages per sample file |
+| `test_outages` | Outage scan | Days and start date per uploaded file |
+| `test_outage_incidents` | Outage scan | The incidents found in each uploaded file |
 
-Only clean data is stored. Stats (availability, downtime, incidents, latency) are calculated from `service_status_logs` when the dashboard asks, so they can never go out of date.
+Only clean data is stored. Availability, downtime and latency are calculated from `service_status_logs` when the dashboard asks, so they can never go out of date.
 
-The two reference tables hold `dataset_incident_log.json`. They are used only to **verify** the pipeline's output, never to produce a number shown as real data.
+The two outage scan tables are written only by the Lambda (`AWS/lambda_function.py`), in the same transaction that saves a file's checks. The API only reads them. They are built from the stored checks, never from `dataset_incident_log.json`, which is used only to **verify** the pipeline's output.
 
 ---
 

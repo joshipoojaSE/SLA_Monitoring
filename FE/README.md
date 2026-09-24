@@ -21,7 +21,7 @@ The API must allow this origin: set `CORS_ORIGINS` in `BE/.env` (it defaults to 
 
 | Route | What it does |
 |---|---|
-| `/upload` | Sends a CSV to `POST /uploads`, then `POST /outage` for the new file, and shows the cleaning report |
+| `/upload` | Sends a CSV to `POST /uploads`, polls `GET /uploads/{id}` until the Lambda is done, then shows a report from `GET /files/{id}/stats` |
 | `/` | Dashboard for one uploaded file (newest by default): collapsible SLA stats on top, filterable check logs below |
 
 The dashboard keeps its state in the query string (`file`, `mode`, `from`, `to`, `service`, `outcome`, `page`), so a filtered view can be reloaded or shared as a link. Clicking a service row filters the logs to that service; "View logs" on an incident filters them to its service and day.

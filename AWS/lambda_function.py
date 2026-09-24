@@ -67,6 +67,10 @@ MAX_HEALTHY_GAP_SLOTS = 0
 # How many rejected rows are written to the log as examples.
 MAX_LOGGED_REJECTIONS = 20
 
+# Neon can take a few seconds to wake a suspended compute; fail rather than
+# hang until the Lambda's own timeout.
+CONNECT_TIMEOUT_SECONDS = 10
+
 
 class RowError(ValueError):
     """A single row that cannot be cleaned. Skipped and counted, not fatal."""
@@ -98,11 +102,12 @@ def process_object(bucket: str, key: str) -> None:
         return
     file_id = int(folder)
 
-    with psycopg.connect(DATABASE_URL) as conn:
-        # S3 can deliver the same event more than once. Only an upload still
-        # waiting is worked on; 'done' and 'failed' are final.
-        row = conn.execute("SELECT status FROM uploaded_files WHERE file_id = %s", (file_id,)).fetchone()
-        conn.commit()
+    with psycopg.connect(DATABASE_URL, connect_timeout=CONNECT_TIMEOUT_SECONDS) as conn:
+        # S3 can deliver the same event more than once, even to two runs at
+        # the same time. The row lock, held until the final commit, makes a
+        # second run wait for the first and then see 'done' or 'failed', which
+        # are final, so it skips instead of saving the file twice.
+        row = conn.execute("SELECT status FROM uploaded_files WHERE file_id = %s FOR UPDATE", (file_id,)).fetchone()
         if row is None:
             print(f"Skipping {key}: no uploaded_files row {file_id}.")
             return
@@ -138,6 +143,11 @@ def process_object(bucket: str, key: str) -> None:
         f"{ragged} ragged line(s), {stats['rejected']} rejected row(s), "
         f"{stats['duplicates']} duplicate(s), {stats['conflicting_slots']} conflicting slot(s)."
     )
+    if stats["issues"]:
+        print(
+            "  cleaned: "
+            + ", ".join(f"{count} {name.replace('_', ' ')}" for name, count in sorted(stats["issues"].items()))
+        )
     for example in stats["rejected_examples"]:
         print(f"  rejected: {example}")
     for warning in warnings:
@@ -145,8 +155,10 @@ def process_object(bucket: str, key: str) -> None:
 
 
 def _mark_failed(conn: psycopg.Connection, file_id: int, message: str) -> None:
+    # Only a file still processing: never overwrite another run's 'done'.
     conn.execute(
-        "UPDATE uploaded_files SET status = 'failed', error_message = %s WHERE file_id = %s",
+        "UPDATE uploaded_files SET status = 'failed', error_message = %s "
+        "WHERE file_id = %s AND status = 'processing'",
         (message[:1000], file_id),
     )
     conn.commit()
@@ -157,8 +169,8 @@ def _mark_failed(conn: psycopg.Connection, file_id: int, message: str) -> None:
 # --------------------------------------------------------------------------
 
 
-def read_rows(csv_text: str) -> tuple[list[tuple[int, dict[str, str], tuple[str, ...]]], int]:
-    """Split the body into (line, values by column, raw values) rows.
+def read_rows(csv_text: str) -> tuple[list[tuple[int, dict[str, str]]], int]:
+    """Split the body into (line, values by column) rows.
 
     The API has already checked the header, so it is only normalized here.
     Returns the rows, and how many lines had the wrong number of fields."""
@@ -175,7 +187,7 @@ def read_rows(csv_text: str) -> tuple[list[tuple[int, dict[str, str], tuple[str,
         if len(values) != width:
             ragged += 1
             continue
-        rows.append((reader.line_num, dict(zip(header, values)), tuple(values)))
+        rows.append((reader.line_num, dict(zip(header, values))))
 
     if not rows:
         raise FileError("The file has a header but no data rows.")
@@ -304,16 +316,14 @@ def clean_rows(rows) -> tuple[list[dict], int, dict]:
     rejected: list[str] = []
     cleaned: list[dict] = []
 
-    for line, values, _ in rows:
+    for line, values in rows:
         try:
             cleaned.append(_clean_row(line, values, issues))
         except RowError as exc:
             rejected.append(f"line {line}: {exc}")
 
     if not cleaned:
-        raise FileError(
-            "No row in the file could be read as a health check. Examples: " + "; ".join(rejected[:5])
-        )
+        raise FileError("No row in the file could be read as a health check. Examples: " + "; ".join(rejected[:5]))
 
     slots: dict[tuple[str, datetime], list[dict]] = {}
     for check in cleaned:
@@ -334,7 +344,7 @@ def clean_rows(rows) -> tuple[list[dict], int, dict]:
         "rejected_examples": rejected[:MAX_LOGGED_REJECTIONS],
         "duplicates": len(cleaned) - len(checks),
         "conflicting_slots": conflicting,
-        **issues,
+        "issues": dict(issues),
     }
     return checks, len(rows), stats
 
@@ -424,7 +434,15 @@ def save(conn: psycopg.Connection, file_id: int, checks: list[dict]) -> list[str
         with cur.copy(f"COPY staged_checks ({CHECK_COLUMNS}) FROM STDIN") as copy:
             for c in checks:
                 copy.write_row(
-                    (file_id, c["service_id"], c["checked_at"], c["status_code"], c["outcome"], c["latency_ms"], c["agent_id"])
+                    (
+                        file_id,
+                        c["service_id"],
+                        c["checked_at"],
+                        c["status_code"],
+                        c["outcome"],
+                        c["latency_ms"],
+                        c["agent_id"],
+                    )
                 )
         stored = cur.execute(INSERT_CHECKS).rowcount
 
@@ -497,8 +515,5 @@ def _record_outages(conn: psycopg.Connection, file_id: int, checks: list[dict]) 
         cur.executemany(
             "INSERT INTO test_outage_incidents (file_id, service_id, day_index, checkpoint_start, checkpoint_end) "
             "VALUES (%s, %s, %s, %s, %s)",
-            [
-                (file_id, i["service_id"], i["day_index"], i["checkpoint_start"], i["checkpoint_end"])
-                for i in incidents
-            ],
+            [(file_id, i["service_id"], i["day_index"], i["checkpoint_start"], i["checkpoint_end"]) for i in incidents],
         )

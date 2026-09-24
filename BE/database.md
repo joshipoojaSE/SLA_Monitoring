@@ -159,7 +159,7 @@ Design notes:
 
 ## 6. Outage scan tables
 
-Every upload finds the incidents in its own `service_status_logs` and stores them here, in the same transaction that saves the checks (section 8). The input is only the stored checks, never `dataset_incident_log.json`. The dashboard reads incidents only from these tables; it never works them out from the checks per request.
+The Lambda (`AWS/lambda_function.py`) is the only writer of these tables. It finds the incidents in each upload's checks and stores them here, in the same transaction that saves the checks (section 8). The input is only the stored checks, never `dataset_incident_log.json`. The dashboard reads incidents only from these tables; it never works them out from the checks per request.
 
 Both tables are keyed by `file_id`, not file name. File names repeat (the same CSV uploaded twice, or a corrected file under the same name), and each upload is its own dataset with its own scan. Deleting an upload deletes its scan with it.
 
@@ -198,7 +198,7 @@ An incident that runs past midnight is stored as one row per day, because a row 
 
 The last row holds because a healthy check always ends an incident (`MAX_HEALTHY_GAP_SLOTS = 0`), so every slot in a stored range failed.
 
-**How the data gets in:** written once per file, as part of the upload. `POST /outage?file_id=…` reads the stored rows back, and scans only an upload saved before scanning was part of the upload.
+**How the data gets in:** written once per file by the Lambda, as part of the upload. The API has no endpoint that writes them: `GET /files/{file_id}/stats` and `GET /files/{file_id}/stats/incidents` only read them back.
 
 ---
 

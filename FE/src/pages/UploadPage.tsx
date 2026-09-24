@@ -1,16 +1,17 @@
 import { useState, type DragEvent, type FormEvent } from 'react'
 import { Link } from 'react-router-dom'
-import type { OutageReport, UploadStatus } from '../api/types'
+import type { DashboardStats, UploadStatus } from '../api/types'
 import { Badge, Card, Spinner, StateMessage } from '../components/ui'
 import { useUpload } from '../hooks/queries'
 import { formatDateTime, formatMinutes, formatNumber } from '../lib/format'
 
-function Report({ upload, outages }: { upload: UploadStatus; outages: OutageReport }) {
+function Report({ upload, stats }: { upload: UploadStatus; stats: DashboardStats }) {
+  const affected = stats.services.filter((service) => service.incidents > 0).map((service) => service.service_id)
   const facts: [string, string][] = [
     ['Rows received', formatNumber(upload.rows_received)],
     ['Uploaded', formatDateTime(upload.uploaded_at)],
-    ['Incidents found', `${outages.incidents_found} (${formatMinutes(outages.total_downtime_minutes)} downtime)`],
-    ['Services affected', outages.services_affected.join(', ') || 'None'],
+    ['Incidents found', `${stats.incident_count} (${formatMinutes(stats.total_downtime_minutes)} downtime)`],
+    ['Services affected', affected.join(', ') || 'None'],
   ]
 
   return (
@@ -100,7 +101,7 @@ export function UploadPage() {
       </form>
 
       {upload.error && <StateMessage tone="error">{upload.error.message}</StateMessage>}
-      {upload.data && <Report upload={upload.data.upload} outages={upload.data.outages} />}
+      {upload.data && <Report upload={upload.data.upload} stats={upload.data.stats} />}
     </div>
   )
 }

@@ -51,16 +51,15 @@ async function waitForUpload(fileId: number): Promise<UploadStatus> {
   }
 }
 
-/** Upload, wait for the Lambda to save it, then read back its outage scan. */
+/** Upload, wait for the Lambda to save and scan it, then read back its stats. */
 export const useUpload = () => {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: async (file: File) => {
       const accepted = await api.upload(file)
       const upload = await waitForUpload(accepted.file_id)
-      // The Lambda has already scanned the file, so this only reads the result.
-      const outages = await api.scanOutages(upload.file_id)
-      return { upload, outages }
+      const stats = await api.stats(upload.file_id)
+      return { upload, stats }
     },
     onSuccess: ({ upload }) => {
       queryClient.invalidateQueries({ queryKey: ['files'] })

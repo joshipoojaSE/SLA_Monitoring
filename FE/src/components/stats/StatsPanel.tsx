@@ -83,11 +83,6 @@ export function StatsPanel({ stats, isLoading, error, onSelectService, onSelectI
           ) : (
             <>
               <KpiTiles stats={stats} />
-              {!stats.scanned && (
-                <p className="text-xs text-amber-700">
-                  This file has not been scanned for outages yet, so no incidents are shown for it.
-                </p>
-              )}
               <div>
                 <h3 className="mb-2 text-sm font-semibold">By service</h3>
                 {/* Keyed by file, so switching files starts each table again from page 1. */}

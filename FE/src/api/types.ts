@@ -7,8 +7,6 @@ export interface FileSummary {
   file_name: string
   uploaded_at: string
   rows_received: number
-  stored_checks: number
-  scanned: boolean
 }
 
 export interface ServiceStats {
@@ -42,7 +40,6 @@ export interface OutageIncident {
 export interface DashboardStats {
   file_id: number
   file_name: string
-  scanned: boolean
   sla_target_pct: number
   coverage_start: string
   coverage_end: string
@@ -116,13 +113,4 @@ export interface UploadStatus {
   status: 'processing' | 'done' | 'failed'
   error_message: string | null
   rows_received: number
-}
-
-export interface OutageReport {
-  file_id: number
-  file_name: string
-  already_processed: boolean
-  incidents_found: number
-  services_affected: string[]
-  total_downtime_minutes: number
 }
